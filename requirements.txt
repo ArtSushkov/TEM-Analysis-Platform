@@ -1,0 +1,28 @@
+# TEM Analysis Platform — common dependencies
+# Tested on Python 3.10+
+#
+# All apps in this repo share a single virtual environment created at the project root.
+# To set up:
+#   python -m venv .venv
+#   .venv\Scripts\activate          (Windows)
+#   source .venv/bin/activate       (Linux/macOS)
+#   pip install -r requirements.txt
+
+# === Web UI ===
+streamlit>=1.30
+
+# === Numerical computing ===
+numpy>=1.24
+scipy>=1.10
+
+# === Image processing ===
+opencv-python>=4.8
+scikit-image>=0.21
+
+# === TIFF / microscopy formats (incl. LZW compression) ===
+tifffile>=2023.7.10
+imagecodecs>=2023.9.18
+
+# === Plotting ===
+matplotlib>=3.7
+plotly>=5.18

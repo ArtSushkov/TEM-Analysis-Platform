@@ -1,0 +1,95 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# === Virtual environments ===
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# === Distribution / packaging ===
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+develop-eggs/
+sdist/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+
+# === Testing / coverage ===
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# === Type checkers / linters ===
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.typeshed/
+
+# === Jupyter ===
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# === Streamlit ===
+.streamlit/secrets.toml
+
+# === IDE / editors ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Data (do not commit!) ===
+# App input and output files
+upload/
+uploads/
+data/raw/
+data/processed/
+samples/
+# Heavy image formats (use small samples or git-lfs for tests)
+*.tif
+*.tiff
+*.dm3
+*.dm4
+# To commit examples, uncomment:
+# !docs/images/*.png
+# !apps/*/samples/*.png
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.log
+
+# === OS ===
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
