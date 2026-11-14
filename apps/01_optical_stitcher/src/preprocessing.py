@@ -75,12 +75,20 @@ def sharpness_map(img: np.ndarray, block_size: int = 16) -> np.ndarray:
 def feather_mask(
     img: np.ndarray,
     edge_feather: int = 64,
+    hard_left: bool = False,
+    hard_right: bool = False,
+    hard_top: bool = False,
+    hard_bottom: bool = False,
 ) -> np.ndarray:
     """Simple mask with smooth falloff toward edges.
 
     Used as DEFAULT for blending — works robustly
     in zones with a single tile (no overlap), does not produce artifacts
     on dark microscope images.
+
+    Sides flagged hard_* (True) keep full weight right up to the edge —
+    used for tiles bordering a "no overlap" black gap, so the gap has
+    crisp image borders instead of a soft fade.
 
     Returns: float32 HxW, values in [0, 1].
     """
@@ -90,11 +98,15 @@ def feather_mask(
         ef = min(edge_feather, h // 2, w // 2)
         if ef > 0:
             ramp = np.linspace(0, 1, ef, dtype=np.float32)
-            # Falloff toward each side
-            mask[:ef, :] *= ramp[:, None]
-            mask[-ef:, :] *= ramp[::-1][:, None]
-            mask[:, :ef] *= ramp[None, :]
-            mask[:, -ef:] *= ramp[::-1][None, :]
+            # Falloff toward each side (skipped on hard sides)
+            if not hard_top:
+                mask[:ef, :] *= ramp[:, None]
+            if not hard_bottom:
+                mask[-ef:, :] *= ramp[::-1][:, None]
+            if not hard_left:
+                mask[:, :ef] *= ramp[None, :]
+            if not hard_right:
+                mask[:, -ef:] *= ramp[::-1][None, :]
     return mask
 
 
@@ -104,6 +116,10 @@ def focus_weight_mask(
     edge_feather: int = 64,
     base_weight: float = 0.3,
     gamma: float = 1.5,
+    hard_left: bool = False,
+    hard_right: bool = False,
+    hard_top: bool = False,
+    hard_bottom: bool = False,
 ) -> np.ndarray:
     """Focus-weighted mask for blending.
 
@@ -117,6 +133,8 @@ def focus_weight_mask(
     base_weight: minimum weight in the tile center (0.3 = 30% of max).
         Increase to 0.5-0.7 for more stability.
         Set to 0.0 for pure focus-weighted blending (legacy behavior).
+    hard_*: keep full weight on that side (no feather falloff) — used for
+        tiles bordering a "no overlap" black gap.
 
     Returns: float32 HxW, values in [0, 1].
     """
@@ -125,7 +143,11 @@ def focus_weight_mask(
 
     # Add base weight: even in zones with poor sharpness
     # the weight does not drop below base_weight * (feather mask)
-    feather = feather_mask(img, edge_feather=edge_feather)
+    feather = feather_mask(
+        img, edge_feather=edge_feather,
+        hard_left=hard_left, hard_right=hard_right,
+        hard_top=hard_top, hard_bottom=hard_bottom,
+    )
     combined = np.maximum(sharp, base_weight) * feather
     # Normalize to [0, 1]
     cmax = combined.max()

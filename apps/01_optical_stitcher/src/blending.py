@@ -35,6 +35,11 @@ class PlacedTile:
     offset_x: int              # position of the top-left corner on the canvas
     offset_y: int
     weight: Optional[np.ndarray] = None  # HxW float32 weights (if None — will be computed)
+    # Sides that keep FULL weight up to the edge (no feather falloff):
+    # (left, right, top, bottom). Used for tiles bordering a "no overlap"
+    # black gap so the separator band gets crisp image borders. Ignored
+    # when a precomputed `weight` is supplied.
+    hard_edges: Tuple[bool, bool, bool, bool] = (False, False, False, False)
 
 
 def compensate_gain(
@@ -170,6 +175,9 @@ def blend_tiles(
     min_total_weight: protection — if total weight in a pixel is below this,
         but the pixel is covered by at least one tile, the division is corrected.
 
+    Pixels not covered by any tile (zero coverage — e.g. the black gap of a
+    "no overlap" pair or ragged canvas corners) are returned as pure black.
+
     Returns: BGR uint8 HxWx3.
     """
     canvas_h, canvas_w = canvas_size
@@ -227,6 +235,7 @@ def blend_tiles(
         tile_img = img_compensated[:actual_h, :actual_w].astype(np.float32)
 
         # Weight mask in tile size
+        hl, hr, ht, hb = tile.hard_edges
         if tile.weight is not None:
             tile_weight = tile.weight[:actual_h, :actual_w].astype(np.float32)
             if use_focus_weights and gamma_correction != 1.0:
@@ -235,9 +244,13 @@ def blend_tiles(
             tile_weight = preprocessing.focus_weight_mask(
                 tile_img, block_size=block_size, edge_feather=feather,
                 base_weight=focus_base_weight, gamma=gamma_correction,
+                hard_left=hl, hard_right=hr, hard_top=ht, hard_bottom=hb,
             )
         else:
-            tile_weight = preprocessing.feather_mask(tile_img, edge_feather=feather)
+            tile_weight = preprocessing.feather_mask(
+                tile_img, edge_feather=feather,
+                hard_left=hl, hard_right=hr, hard_top=ht, hard_bottom=hb,
+            )
 
         # Build tile-sized pyramids (small! max ~60 MB)
         tile_lap_pyr = _build_laplacian_pyramid(tile_img, levels)
@@ -298,4 +311,8 @@ def blend_tiles(
     # === Step 5: Reconstruct the final image ===
     final = _reconstruct_from_laplacian(canvas_laps)
     final = np.clip(final, 0, 255).astype(np.uint8)
+    # Pixels outside every tile are pure black: this removes the pyramid
+    # upsampling bleed into the black gap of "no overlap" pairs (and into
+    # ragged canvas corners), so separator bands have crisp borders.
+    final[~has_coverage] = 0
     return final

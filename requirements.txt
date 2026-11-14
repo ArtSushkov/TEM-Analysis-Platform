@@ -18,6 +18,10 @@ scipy>=1.10
 # === Image processing ===
 opencv-python>=4.8
 scikit-image>=0.21
+scikit-learn>=1.0          # DBScan for FFT-based grain segmentation (app 02)
+
+# === Data handling ===
+pandas>=2.0                # editable table for reference d-spacings (app 02)
 
 # === TIFF / microscopy formats (incl. LZW compression) ===
 tifffile>=2023.7.10
@@ -26,3 +30,15 @@ imagecodecs>=2023.9.18
 # === Plotting ===
 matplotlib>=3.7
 plotly>=5.18
+
+# === SAM (Segment Anything Model) for app 02 ===
+# Optional: only needed for SAM (auto/click) layer selection modes in apps/02_grain_analyzer.
+# The app falls back to Polygon (click vertices) or Manual rows mode if these are not installed.
+# For CPU-only torch (smaller download), use:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# torch>=2.0
+# torchvision>=0.15
+# segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+
+# === Click-on-image for app 02 (SAM click mode + Polygon click mode) ===
+streamlit-image-coordinates>=0.4.0

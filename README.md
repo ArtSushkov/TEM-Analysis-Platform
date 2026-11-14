@@ -13,7 +13,7 @@ The platform follows a **modular monorepo** principle: each task gets its own st
 | # | Folder | Description | Status |
 |---|---|---|---|
 | 01 | [`apps/01_optical_stitcher`](apps/01_optical_stitcher) | Stitching a series of optical microscope images into a panorama (for TEM cross-section prep) | Ready |
-| 02 | `apps/02_*` | *(reserved)* | Planned |
+| 02 | [`apps/02_grain_analyzer`](apps/02_grain_analyzer) | Grain-size characterisation of a polycrystalline layer on a TEM cross-section (auto pixel-size from OlympusSIS tag, watershed segmentation, lognormal fit, batch statistics) | Ready |
 
 ### Repository Structure
 
@@ -21,7 +21,8 @@ The platform follows a **modular monorepo** principle: each task gets its own st
 tem-analysis-platform/
 ├── requirements.txt          # Shared dependencies for all apps
 ├── apps/                     # Streamlit apps (each is standalone in code)
-│   └── 01_optical_stitcher/
+│   ├── 01_optical_stitcher/
+│   └── 02_grain_analyzer/
 ├── docs/                     # Platform-level documentation
 └── shared/                   # Shared utilities (future)
 ```
@@ -67,7 +68,7 @@ The app opens in your browser at `http://localhost:8501`.
 No need to deactivate — just run another app from the same activated environment:
 
 ```bash
-streamlit run apps/02_spectrum_viewer/app.py     # (when available)
+streamlit run apps/02_grain_analyzer/app.py
 ```
 
 ### 5. Deactivate when done

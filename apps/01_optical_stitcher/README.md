@@ -11,6 +11,9 @@ Preparing cross-sections for TEM often requires inspecting the disk surface on a
 ## Features
 
 - **Automatic relative position estimation** between adjacent images (SIFT + RANSAC)
+- **Pair Review tab** — verify every pair visually and adjust positions by hand
+- **No-overlap pairs** — mark accidentally non-overlapping shots with a checkbox;
+  they are placed side by side with a visible black gap on the panorama
 - **Robust to dark images** via CLAHE preprocessing
 - **Multi-band blending** — invisible seams even with blurred tile edges
 - **Fallback strategies**: phase correlation and NCC scan in case SIFT fails
@@ -81,11 +84,32 @@ In the sidebar, choose the upload method:
 The sidebar exposes settings for feature detection, preprocessing, and blending.
 See the in-app **Help** tab for a detailed explanation of each setting.
 
-### 5. Run
+### 5. Pair Review (manual alignment, recommended for hand-captured rows)
 
-Click **Stitch panorama**. Progress is shown in real time.
+Open the **Pair Review** tab for an interactive workflow that does not require
+a precise `Expected overlap` prior:
 
-### 6. Result
+1. **Estimate** — fast automatic estimate of every adjacent pair on downscaled copies.
+2. **Review** — each pair is shown as an overlay (Blend / Checkerboard / Difference)
+   with tile outlines A (yellow) and B (cyan). Tick **Position is correct** for good pairs.
+   If two neighbouring shots were captured **without any overlap**, tick
+   **No overlap (black gap)** instead — the pair is placed side by side with a visible
+   black band on the panorama (gap width configurable in Step 2; unticking restores
+   the previous position). Such a pair counts as approved.
+3. **Adjust** — unticked pairs get nudge buttons (1–100 px steps) and numeric dx/dy
+   inputs with a live overlay. Increasing `dx` moves the tiles apart (less overlap).
+4. **Stitch** — the panorama is blended using exactly the reviewed positions;
+   no algorithm can override what you approved.
+
+Positions, approvals and no-overlap marks can be exported/imported as JSON, so a
+review session survives browser refreshes.
+
+### 6. Run
+
+Click **Stitch panorama** (Stitcher tab) or **Stitch panorama with these positions**
+(Pair Review tab). Progress is shown in real time.
+
+### 7. Result
 
 - Preview of the stitched panorama
 - Diagnostics table for each pair (method, dx/dy, rotation, matches, inliers)
@@ -128,15 +152,16 @@ Click **Stitch panorama**. Progress is shown in real time.
 
 ```
 01_optical_stitcher/
-├── app.py                  # Streamlit UI
+├── app.py                  # Streamlit UI (Stitcher / Pair Review / Help tabs)
 ├── README.md
 └── src/
     ├── __init__.py
     ├── io_utils.py         # Loading + _N parsing + sorting
     ├── preprocessing.py    # CLAHE + sharpness map
     ├── stitching.py        # SIFT+RANSAC + fallbacks
+    ├── pair_review.py      # Review-scale estimation + overlay previews + JSON session
     ├── blending.py         # Multi-band blending (memory-optimized)
-    └── pipeline.py         # Orchestration
+    └── pipeline.py         # Orchestration (+ reviewed-position overrides)
 ```
 
 ## Troubleshooting
