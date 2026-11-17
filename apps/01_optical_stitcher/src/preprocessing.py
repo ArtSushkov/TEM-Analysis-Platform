@@ -42,13 +42,16 @@ def apply_clahe(
 
 
 def sharpness_map(img: np.ndarray, block_size: int = 16) -> np.ndarray:
-    """Local sharpness map (Laplacian variance per block).
+    """Local sharpness map (Laplacian variance per block), normalized per-tile.
 
-    Used for focus-weighted blending: pixels from sharper
-    blocks get higher weight during blending. Solves the problem
-    of blurred tile edges in microscopy.
+    Used by the legacy `focus_weight_mask` mode: pixels from sharper
+    blocks within ONE tile get higher weight. The output is normalized
+    to [0, 1] per tile, so this metric is NOT comparable across tiles —
+    a uniformly blurred tile can still dominate a uniformly sharp one
+    if its feather weight is higher at a given pixel. Use
+    `tenengrad_map` for cross-tile focus comparison (focus-priority mode).
 
-    Returns: float32 array of the same HxW as input.
+    Returns: float32 array of the same HxW as input, range [0, 1].
     """
     gray = to_gray(img).astype(np.float32)
     lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
@@ -69,6 +72,43 @@ def sharpness_map(img: np.ndarray, block_size: int = 16) -> np.ndarray:
         sharp = (sharp - smin) / (smax - smin)
     else:
         sharp = np.zeros_like(sharp)
+    return sharp.astype(np.float32)
+
+
+def tenengrad_map(img: np.ndarray, block_size: int = 16) -> np.ndarray:
+    """Tenengrad focus measure for cross-tile sharpness comparison.
+
+    Returns the local gradient-magnitude-squared energy
+    (sum of squared Sobel responses), block-averaged and lightly
+    smoothed. The output is NOT normalized per-tile — values stay on
+    an absolute scale, so a tile with genuinely sharper content in the
+    overlap zone scores higher than a uniformly blurred neighbor even
+    when both have a similar internal sharpness distribution.
+
+    Tenengrad is preferred over Laplacian variance (`sharpness_map`)
+    for cross-tile comparison because it is:
+      - more robust to sensor noise (Sobel is a first-derivative
+        operator, less sensitive to single-pixel spikes);
+      - more robust to brightness variations after gain compensation
+        (the metric scales with contrast, not with absolute intensity,
+        and gain compensation has already equalized the brightness
+        baseline across tiles).
+
+    Used by focus-priority blending (winner-takes-all at high
+    frequencies; see `blend_tiles(focus_priority=True)`).
+
+    Returns: float32 HxW, non-negative absolute scores (NOT in [0, 1]).
+    """
+    gray = to_gray(img).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    energy = gx * gx + gy * gy  # squared gradient magnitude
+
+    kernel = np.ones((block_size, block_size), dtype=np.float32) / (block_size * block_size)
+    sharp = cv2.filter2D(energy, -1, kernel, borderType=cv2.BORDER_REFLECT)
+    # Light smoothing so the winner map does not flicker per pixel
+    sharp = cv2.GaussianBlur(sharp, (0, 0), sigmaX=block_size / 2.0)
+    sharp = np.clip(sharp, 0.0, None)
     return sharp.astype(np.float32)
 
 

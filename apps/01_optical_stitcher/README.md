@@ -171,8 +171,12 @@ Click **Stitch panorama** (Stitcher tab) or **Stitch panorama with these positio
 See the in-app **Help** tab for a full troubleshooting guide. The most common issues:
 
 - **"Unable to allocate ... GiB" (OOM)**: reduce `Laplacian pyramid levels` to 3-4
-- **Dark zone at the panorama edge**: ensure `Use focus-weighted mask` is OFF (default)
+- **Dark zone at the panorama edge**: keep `Blending weight mode` on `Feather (default)`
 - **Visible seam**: increase `Laplacian pyramid levels` to 6-7 and `Gain compensation` to 1.0
+- **Want the sharpest detail to win in the overlap zone** (operator focused each frame on a
+  different depth): switch `Blending weight mode` to `Focus-priority (cross-tile)` — the tile
+  with the highest Tenengrad focus score wins the high-frequency content; low frequencies are
+  still averaged so brightness stays smooth and residual alignment errors are not revealed
 - **All methods failed**: increase `SIFT features` to 10000, lower `Lowe ratio threshold` to 0.7
 
 ## License

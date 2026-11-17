@@ -121,6 +121,9 @@ def stitch_row(
     blend_gamma: float = 1.5,
     blend_gain_strength: float = 0.8,
     blend_use_focus_weights: bool = False,
+    blend_focus_priority: bool = False,
+    blend_focus_priority_gamma: float = 6.0,
+    blend_focus_priority_levels: int = 2,
     pair_translations: Optional[List[Tuple[float, float]]] = None,
     pair_methods: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[str, float], None]] = None,
@@ -367,6 +370,9 @@ def stitch_row(
         gamma_correction=blend_gamma,
         gain_strength=blend_gain_strength,
         use_focus_weights=blend_use_focus_weights,
+        focus_priority=blend_focus_priority,
+        focus_priority_gamma=blend_focus_priority_gamma,
+        focus_priority_levels=blend_focus_priority_levels,
     )
 
     report("Done!", 1.0)

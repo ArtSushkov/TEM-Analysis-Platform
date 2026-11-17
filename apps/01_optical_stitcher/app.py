@@ -105,6 +105,39 @@ def _param(key: str, default):
     return st.session_state.get(key, default)
 
 
+def _blend_mode_params() -> dict:
+    """Resolve the `Blending weight mode` radio to the underlying pipeline kwargs.
+
+    Returns a dict with the three weight-mode parameters
+    (`blend_use_focus_weights`, `blend_focus_priority`,
+    `blend_focus_priority_gamma`, `blend_focus_priority_levels`) so both
+    `stitch_row()` call sites stay in sync with the sidebar.
+
+    Radio modes:
+      "Feather (default)"            -> feather mask only
+      "Focus-weighted (per-tile)"    -> legacy focus_weight_mask
+      "Focus-priority (cross-tile)"  -> winner-takes-all at high freq
+    """
+    mode = st.session_state.get("blend_weight_mode", "Feather (default)")
+    if mode == "Focus-weighted (per-tile)":
+        return {
+            "blend_use_focus_weights": True,
+            "blend_focus_priority": False,
+        }
+    if mode == "Focus-priority (cross-tile)":
+        return {
+            "blend_use_focus_weights": False,
+            "blend_focus_priority": True,
+            "blend_focus_priority_gamma": _param("focus_priority_gamma", 6.0),
+            "blend_focus_priority_levels": _param("focus_priority_levels", 2),
+        }
+    # Feather (default) and any unknown value
+    return {
+        "blend_use_focus_weights": False,
+        "blend_focus_priority": False,
+    }
+
+
 def _current_upload_signature():
     """Stable signature of the current upload (used to cache loaded tiles)."""
     mode = st.session_state.get("upload_mode", "Multiple files")
@@ -404,9 +437,28 @@ def render_help_tab():
     st.markdown("### Focus")
     st.markdown(
         "If the specimen is uneven, some frames may be partially out of focus. "
-        "This is acceptable — the multi-band blending will handle it. "
-        "If you see blur at tile edges, enable `Use focus-weighted mask` (but be aware "
-        "it may cause dark zones on very dark images — see Troubleshooting)."
+        "For typical dark-field optical microscopy the default **Feather** "
+        "blending mode is the most stable choice — it averages the overlap "
+        "zone between two tiles, which hides small alignment errors."
+    )
+    st.markdown(
+        "**When to use Focus-priority blending.** If the operator focused "
+        "each frame on a different depth of the cross-section and the goal "
+        "is to **see the sharpest detail** at every point rather than a "
+        "smoothly-averaged picture, switch the **Blending weight mode** in "
+        "the sidebar to **Focus-priority (cross-tile)**. In the overlap "
+        "zone, the tile whose Tenengrad focus measure is highest at a given "
+        "pixel wins the high-frequency content (edges, fine detail); low "
+        "frequencies are still averaged so brightness and illumination "
+        "transitions stay smooth and small residual alignment errors are "
+        "not revealed as visible steps. This is the same technique used by "
+        "focus-stacking software (Helicon Focus, Zerene Stacker)."
+    )
+    st.markdown(
+        "**Focus-weighted (per-tile)** is a legacy mode: it weights pixels "
+        "by their sharpness *within each tile*, but does not compare "
+        "sharpness across tiles. Use Focus-priority instead when you want "
+        "the sharpest tile to win in the overlap."
     )
 
     st.markdown("### Number of Images")
@@ -496,12 +548,28 @@ def render_help_tab():
         "| **Feather zone width (px)** | 64 | Smooth mask falloff at tile edges. "
         "Larger = softer seam transition. |"
         "\n"
-        "| **Use focus-weighted mask** | OFF | When ON, pixels from sharper zones get higher weight. "
-        "Useful when tile edges are blurred. May cause dark zones on very dark images — "
-        "leave OFF for typical dark-field optical microscopy. |"
+        "| **Blending weight mode** | Feather (default) | Three mutually exclusive modes. "
+        "**Feather** — smooth mask, robust on dark images; both tiles contribute to the seam "
+        "(averaged). **Focus-weighted (per-tile)** — pixels in sharper zones of EACH tile "
+        "get higher weight; per-tile normalization means sharpness is not compared across "
+        "tiles. **Focus-priority (cross-tile)** — in the overlap zone, the tile with the "
+        "highest Tenengrad focus score wins the high-frequency content; low frequencies are "
+        "still averaged so brightness stays smooth and residual alignment errors are not "
+        "revealed. Use Focus-priority when the operator focused each frame on a different "
+        "depth and the goal is to see the sharpest detail. |"
         "\n"
-        "| **Gamma for focus weights** | 1.5 | Contrast of sharpness weights. "
-        "Only used when focus-weighted mask is ON. |"
+        "| **Focus-priority strength (gamma)** | 6.0 | Exponent on the Tenengrad score. "
+        "Higher = stronger winner-takes-all (the sharpest tile contributes ~95% of the "
+        "detail when its score is ~2x the runner-up). Lower = softer, more averaged. "
+        "Only shown when Focus-priority is selected. |"
+        "\n"
+        "| **Focus-priority high-frequency levels** | 2 | How many of the top pyramid levels "
+        "(finest detail) use the focus winner weight; the rest are averaged with a feather "
+        "mask. Increase to push focus selection into coarser structure too (risk: reveals "
+        "residual misalignment as visible steps). Only shown when Focus-priority is selected. |"
+        "\n"
+        "| **Gamma for focus weights** | 1.5 | Contrast of per-tile sharpness weights. "
+        "Only shown when Focus-weighted (per-tile) is selected. |"
         "\n"
         "| **Gain compensation** | 0.8 | Equalizes average brightness between tiles. "
         "0 = off, 1 = full correction. Useful when illumination varies between shots. |"
@@ -579,11 +647,14 @@ def render_help_tab():
 
     with st.expander("Dark zone appears at the edge of the panorama"):
         st.markdown(
-            "**Cause**: `Use focus-weighted mask` is enabled, and the dark microscope images "
-            "produce near-zero sharpness values, causing blending to fail in non-overlap zones."
+            "**Cause**: The `Focus-weighted (per-tile)` blending mode is enabled, "
+            "and the dark microscope images produce near-zero sharpness values, "
+            "causing blending to fail in non-overlap zones."
             "\n\n"
-            "**Fix**: Disable `Use focus-weighted mask` (default). The simple feather mask "
-            "is stable for dark images."
+            "**Fix**: Switch **Blending weight mode** back to **Feather (default)**. "
+            "The feather mask is stable for dark images. **Focus-priority (cross-tile)** "
+            "is also safe on dark images — it always falls back to a feather mask in "
+            "non-overlap zones."
         )
 
     with st.expander("\"Unable to allocate ... GiB for an array\" (Out of Memory)"):
@@ -594,7 +665,9 @@ def render_help_tab():
             "\n"
             "1. Reduce `Laplacian pyramid levels` to 3–4."
             "\n"
-            "2. Ensure `Use focus-weighted mask` is OFF (default)."
+            "2. Keep **Blending weight mode** on **Feather (default)** — the legacy "
+            "Focus-weighted mode and the new Focus-priority mode each build one extra "
+            "per-tile weight pyramid (small, tile-sized, but non-zero)."
             "\n"
             "3. For very large sets (>30 tiles), split into multiple panoramas."
         )
@@ -777,15 +850,70 @@ def render_sidebar() -> None:
         st.slider("Feather zone width (px)", 0, 200, 64, step=8,
                   key="blend_feather",
                   help="Smooth mask falloff toward tile edges.")
-        st.checkbox("Use focus-weighted mask", value=False,
-                    key="use_focus_weights",
-                    help="Weighting by sharpness map. "
-                         "OFF (default) — simple feather mask, more stable on dark images. "
-                         "ON — better for tiles with blurred edges.")
-        st.slider("Gamma for focus weights", 0.5, 3.0, 1.5, step=0.1,
-                  key="blend_gamma",
-                  help=">1 — sharp zones dominate more. "
-                       "Only used when focus-weighted mask is enabled.")
+
+        # Unified weight-mode selector. Three mutually exclusive modes:
+        # - Feather:               stable default, works on dark images
+        # - Focus-weighted:         legacy per-tile sharpness weighting
+        # - Focus-priority (NEW):   cross-tile winner-takes-all at high
+        #                          frequencies — keeps the sharpest tile's
+        #                          detail in the overlap zone
+        st.radio(
+            "Blending weight mode",
+            options=[
+                "Feather (default)",
+                "Focus-weighted (per-tile)",
+                "Focus-priority (cross-tile)",
+            ],
+            index=0,
+            key="blend_weight_mode",
+            help=(
+                "Feather: smooth mask, robust on dark images. "
+                "Focus-weighted: pixels in sharper zones of EACH tile get "
+                "higher weight (per-tile normalization, does not compare "
+                "across tiles). "
+                "Focus-priority: in the overlap zone, the tile with the "
+                "highest Tenengrad sharpness score wins the high-frequency "
+                "content (edges, fine detail); low frequencies are still "
+                "averaged so brightness stays smooth and residual alignment "
+                "errors are not revealed. Use this when the operator "
+                "focused each frame on a different depth and the goal is "
+                "to see the sharpest detail, not a pretty averaged picture."
+            ),
+            horizontal=False,
+        )
+
+        mode = st.session_state.get("blend_weight_mode", "Feather (default)")
+        if mode == "Focus-weighted (per-tile)":
+            st.slider("Gamma for focus weights", 0.5, 3.0, 1.5, step=0.1,
+                      key="blend_gamma",
+                      help=">1 — sharp zones dominate more within each tile.")
+        elif mode == "Focus-priority (cross-tile)":
+            st.slider(
+                "Focus-priority strength (gamma)", 2.0, 12.0, 6.0, step=0.5,
+                key="focus_priority_gamma",
+                help=(
+                    "Exponent on the Tenengrad sharpness score used as the "
+                    "blend weight at high-frequency pyramid levels. "
+                    "Higher = stronger winner-takes-all: the sharpest tile "
+                    "contributes ~95% of the detail when its score is ~2x "
+                    "the runner-up. Lower = softer, more averaged. "
+                    "Default 6 is a good starting point."
+                ),
+            )
+            st.slider(
+                "Focus-priority high-frequency levels", 1, 4, 2, step=1,
+                key="focus_priority_levels",
+                help=(
+                    "How many of the TOP pyramid levels (finest detail) "
+                    "use the focus winner weight; the rest are averaged "
+                    "with a feather mask so brightness and coarse structure "
+                    "stay smooth. Default 2 = the two highest-frequency "
+                    "bands are chosen by focus. Increase to push the "
+                    "focus selection into coarser structure too (risk: "
+                    "reveals residual misalignment as visible steps)."
+                ),
+            )
+
         st.slider("Gain compensation", 0.0, 1.0, 0.8, step=0.1,
                   key="gain_strength",
                   help="Brightness equalization between tiles. "
@@ -911,7 +1039,7 @@ def render_stitcher_tab():
             blend_feather=_param("blend_feather", 64),
             blend_gamma=_param("blend_gamma", 1.5),
             blend_gain_strength=_param("gain_strength", 0.8),
-            blend_use_focus_weights=_param("use_focus_weights", False),
+            **_blend_mode_params(),
             progress_callback=update_progress,
         )
     except Exception as e:
@@ -1373,7 +1501,7 @@ def render_pair_review_tab():
                 blend_feather=_param("blend_feather", 64),
                 blend_gamma=_param("blend_gamma", 1.5),
                 blend_gain_strength=_param("gain_strength", 0.8),
-                blend_use_focus_weights=_param("use_focus_weights", False),
+                **_blend_mode_params(),
                 pair_translations=final_translations,
                 pair_methods=methods,
                 progress_callback=stitch_cb,

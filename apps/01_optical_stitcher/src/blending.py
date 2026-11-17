@@ -159,6 +159,9 @@ def blend_tiles(
     use_focus_weights: bool = False,
     focus_base_weight: float = 0.3,
     min_total_weight: float = 0.05,
+    focus_priority: bool = False,
+    focus_priority_gamma: float = 6.0,
+    focus_priority_levels: int = 2,
 ) -> np.ndarray:
     """Multi-band blending of tiles on the final canvas (memory-optimized).
 
@@ -166,14 +169,44 @@ def blend_tiles(
     canvas_size: (H, W) of the final image
     levels: number of Laplacian pyramid levels (4-6 typically)
     feather: smooth mask falloff width toward tile edges
-    block_size: block size for the sharpness map (focus mode only)
-    gamma_correction: if > 1, raises weight contrast (focus mode only)
+    block_size: block size for the sharpness map (focus modes only)
+    gamma_correction: if > 1, raises weight contrast (legacy focus-weighted
+        mode only)
     gain_strength: 0.0 — no gain compensation, 1.0 — full brightness correction
-    use_focus_weights: True — focus-weighted mask (for blurred edges),
-        False — simple feather mask (more stable on dark images)
-    focus_base_weight: minimum weight in focus mode (anti-zero protection)
+    use_focus_weights: True — legacy per-tile focus-weighted mask. Off by
+        default because per-tile normalization makes the metric incomparable
+        across tiles.
+    focus_base_weight: minimum weight in legacy focus mode (anti-zero).
     min_total_weight: protection — if total weight in a pixel is below this,
         but the pixel is covered by at least one tile, the division is corrected.
+
+    focus_priority: True — FOCUS-PRIORITY BLENDING (winner-takes-all at high
+        frequencies). In the overlap zone, the tile whose Tenengrad focus
+        measure is highest at a given pixel wins the high-frequency content
+        of the panorama; low frequencies are still averaged with a feather
+        mask so brightness/illumination transitions stay smooth and small
+        residual alignment errors are NOT revealed as visible steps.
+        Designed for the use case where the operator focuses each frame on
+        a different depth and the goal is to keep the sharpest visible
+        detail at every point of the cross-section, not to produce a pretty
+        averaged picture.
+        When True, `use_focus_weights` and `gamma_correction` are ignored.
+    focus_priority_gamma: exponent applied to the Tenengrad score before
+        using it as a weight. Higher = stronger winner-takes-all. The blend
+        weight at a high-frequency level becomes:
+            w_k = (Tenengrad_k + epsilon) ** gamma
+        With gamma=6 the soft-max behavior is sharp enough that the
+        highest-scoring tile contributes ~95% of the high-frequency content
+        when its score is ~2x the runner-up, while still degrading
+        gracefully (no hard seam) when scores are close.
+    focus_priority_levels: number of TOP pyramid levels (levels 0 ..
+        focus_priority_levels - 1) that use the Tenengrad winner weight.
+        Lower-indexed Laplacian levels carry the highest frequencies
+        (edges, fine detail); higher-indexed levels carry coarse structure
+        and the residual. Default 2 = the two highest-frequency bands are
+        chosen by focus, coarser bands are averaged. Increase to push the
+        focus selection into coarser structure too (risk: reveals residual
+        misalignment as visible steps).
 
     Pixels not covered by any tile (zero coverage — e.g. the black gap of a
     "no overlap" pair or ragged canvas corners) are returned as pure black.
@@ -298,6 +331,16 @@ def blend_tiles(
             tile_weight = w_src[:actual_h, :actual_w].astype(np.float32)
             if use_focus_weights and gamma_correction != 1.0:
                 tile_weight = tile_weight ** gamma_correction
+        elif focus_priority:
+            # FOCUS-PRIORITY mode: feather mask is still built (used at low-
+            # frequency levels and for the hard-edge gap guard), but at the
+            # top `focus_priority_levels` pyramid levels the Tenengrad focus
+            # measure overrides the feather weight — see the per-level switch
+            # in the level loop below.
+            tile_weight = preprocessing.feather_mask(
+                tile_img, edge_feather=feather,
+                hard_left=hl, hard_right=hr, hard_top=ht, hard_bottom=hb,
+            )
         elif use_focus_weights:
             tile_weight = preprocessing.focus_weight_mask(
                 tile_img, block_size=block_size, edge_feather=feather,
@@ -315,10 +358,43 @@ def blend_tiles(
         tile_weight_pyr = _build_gaussian_pyramid(tile_weight[..., None], levels)
         tile_weight_pyr_2d = [w[..., 0] if w.ndim == 3 else w for w in tile_weight_pyr]
 
+        # Focus-priority: build a SECOND weight pyramid from the Tenengrad
+        # focus measure. Per-level, the high-frequency levels (0 ..
+        # focus_priority_levels - 1) use this pyramid; the remaining levels
+        # fall back to the feather pyramid above. The Tenengrad map is
+        # computed on the (already gain-compensated) tile_img so the score
+        # is comparable across tiles — see `tenengrad_map` for the rationale.
+        if focus_priority:
+            ten_map = preprocessing.tenengrad_map(tile_img, block_size=block_size)
+            # Soft winner-takes-all: w = (ten + eps) ** gamma
+            # The epsilon is scaled to the tile's own max so it is always
+            # relatively small — it just guarantees that a tile whose
+            # Tenengrad is locally zero still contributes a tiny bit (avoids
+            # div-by-zero in low-contrast zones without disturbing the
+            # winner selection where scores are non-trivial).
+            ten_max = float(ten_map.max())
+            eps = 1e-3 * ten_max if ten_max > 0 else 1e-3
+            ten_weight = (ten_map + eps) ** focus_priority_gamma
+            # Multiply by the feather mask so the hard-edge gap guard
+            # still applies at high-frequency levels: a tile bordering a
+            # black gap keeps full weight up to its hard edge, and the
+            # Tenengrad score (which is ~0 inside the edge-replicated gap
+            # pad) does not let the neighbouring tile "win" the gap zone.
+            # Coverage is later forced to black there anyway, so this is
+            # belt-and-braces.
+            ten_weight = ten_weight * tile_weight
+            ten_pyr = _build_gaussian_pyramid(ten_weight[..., None], levels)
+            ten_pyr_2d = [w[..., 0] if w.ndim == 3 else w for w in ten_pyr]
+        else:
+            ten_pyr_2d = None
+
         # Place each level on the canvas
         for lvl in range(levels + 1):
             lap_l = tile_lap_pyr[lvl]      # (h_l_tile, w_l_tile, 3)
-            w_l = tile_weight_pyr_2d[lvl]  # (h_l_tile, w_l_tile)
+            if focus_priority and lvl < focus_priority_levels:
+                w_l = ten_pyr_2d[lvl]      # high-freq: focus winner weight
+            else:
+                w_l = tile_weight_pyr_2d[lvl]  # low-freq / fallback: feather
 
             # Offset and size on the canvas for this level
             cx0 = _level_offset(x0, lvl)
@@ -344,6 +420,8 @@ def blend_tiles(
 
         # Free tile pyramid memory (not strictly required, but helps GC)
         del tile_lap_pyr, tile_weight_pyr, tile_weight_pyr_2d
+        if ten_pyr_2d is not None:
+            del ten_pyr_2d
 
     # === Step 4: Build coverage pyramid and normalize each level ===
     coverage_pyr = _build_gaussian_pyramid(
