@@ -9,7 +9,7 @@ A Streamlit app for characterising the grain-size distribution of a selected pol
 3. Segments grains using one of five methods (see below).
 4. Measures each grain (area, equivalent diameter, perimeter, circularity, eccentricity, aspect ratio, orientation) and fits a lognormal to the equivalent-diameter distribution.
 5. Produces a self-contained JSON report (measurements + metadata + parameters + colour-labeled grain map embedded as base64 PNG).
-6. In the **Batch Statistics** tab, aggregates several JSON reports into pooled grain-size statistics.
+6. In the **Batch Statistics** section, aggregates several JSON reports into pooled grain-size statistics.
 
 ## Run
 
@@ -55,7 +55,7 @@ Quick start, method description, settings reference, troubleshooting, limitation
 
 ```
 02_grain_analyzer/
-├── app.py                          # Streamlit UI (3 tabs, 5 segmentation methods)
+├── app.py                          # Streamlit UI (3 sections, 5 segmentation methods)
 ├── README.md                       # this file
 └── src/
     ├── __init__.py

@@ -24,9 +24,14 @@ Pipeline
    dominant gradient direction; the fringes are perpendicular to this, but
    for grain segmentation we only care that pixels in the same grain share
    the same orientation.
-4. **Coherence** — ``coherence = sqrt(det) / trace`` measures how anisotropic
-   the local texture is. High coherence = clear lattice fringes (crystalline);
-   low coherence = amorphous/noise (background).
+4. **Coherence** — ``coherence = (λ1−λ2)/(λ1+λ2) = sqrt((Axx−Ayy)² + 4Axy²) /
+   (Axx+Ayy)`` where λ1 ≥ λ2 are the tensor eigenvalues. This is the classic
+   anisotropy measure: coherence ≈ 1 = locally oriented texture (clear lattice
+   fringes, straight boundary — crystalline); coherence ≈ 0 = isotropic
+   gradients (amorphous speckle, noise) or no texture at all (uniform area,
+   vacuum). NOTE: an earlier version used ``sqrt(det)/trace = sqrt(λ1λ2)/(λ1+λ2)``,
+   which is an ISOTROPY measure (≈0.5 for noise, 0 for fringes) — the opposite
+   semantics. The current formula is the correct one.
 5. **Threshold** — pixels with coherence below a threshold are set to
    background.
 6. **Orientation quantisation** — the continuous orientation angle is binned
@@ -147,10 +152,15 @@ def _compute_structure_tensor(image: np.ndarray, sigma: float
 
     Returns
     -------
-    (orientation_deg, coherence, Axx)
-        orientation_deg: (H, W) float64 — dominant direction in degrees [-90, 90).
+    (orientation_deg, coherence, energy)
+        orientation_deg: (H, W) float64 — dominant gradient direction in
+            degrees [-90, 90). The fringes themselves run perpendicular to it.
         coherence: (H, W) float64 — anisotropy in [0, 1].
-        Axx: (H, W) float64 — for debugging.
+            coherence = (λ1−λ2)/(λ1+λ2); 1 = locally oriented (crystalline
+            fringes / straight edge), 0 = isotropic (amorphous/noise) or
+            textureless.
+        energy: (H, W) float64 — trace = λ1+λ2 = total gradient energy
+            ("is there any texture at all").
     """
     # structure_tensor returns (Axx, Axy, Ayy) for 2D.
     Axx, Axy, Ayy = feature.structure_tensor(image, sigma=sigma, order="xy")
@@ -161,15 +171,158 @@ def _compute_structure_tensor(image: np.ndarray, sigma: float
     orientation = 0.5 * np.arctan2(2.0 * Axy, Ayy - Axx)
     orientation_deg = np.degrees(orientation)
 
-    # Coherence = sqrt(det) / trace, measures anisotropy.
-    det = Axx * Ayy - Axy * Axy
+    # Coherence (anisotropy) = (λ1−λ2)/(λ1+λ2).
+    # For a 2×2 symmetric tensor: (λ1−λ2)² = (Axx−Ayy)² + 4·Axy².
+    # 1.0 = all gradient energy in one direction (oriented texture);
+    # 0.0 = isotropic gradients (amorphous speckle / noise) or no texture.
     trace = Axx + Ayy
-    coherence = np.where(trace > 0,
-                          np.sqrt(np.maximum(det, 0.0)) / (trace + 1e-12),
-                          0.0)
+    diff = np.sqrt((Axx - Ayy) ** 2 + 4.0 * Axy ** 2)
+    coherence = np.where(trace > 1e-12, diff / (trace + 1e-12), 0.0)
     coherence = np.clip(coherence, 0.0, 1.0)
 
-    return orientation_deg, coherence, Axx
+    return orientation_deg, coherence, trace
+
+
+def cleanup_grain_mask_with_structure_tensor(
+    image: np.ndarray,
+    grain_mask: np.ndarray,
+    sigma: float = 3.0,
+    coherence_threshold: float = 0.35,
+    orientation_targets_deg: list | None = None,
+    orientation_tolerance_deg: float = 25.0,
+    min_remove_area_px: int = 25,
+) -> tuple[np.ndarray, dict]:
+    """Remove amorphous / wrongly-oriented pixels from a grain mask.
+
+    Designed as a post-filter for click-to-segment (FFT): region growing may
+    include amorphous inclusions or flat areas that sit between the crystal
+    and the region-growing threshold. The structure tensor judges every pixel
+    of the mask independently:
+
+    1. **Coherence gate** — pixels whose local texture is isotropic or
+       textureless (coherence < ``coherence_threshold``) are amorphous /
+       vacuum → removal candidates.
+    2. **Orientation gate** (optional, needs ``orientation_targets_deg``) —
+       pixels with enough gradient energy whose local fringe direction does
+       not match ANY of the target orientations (within tolerance) belong to
+       another grain or an edge artifact → removal candidates. The gradient
+       direction of a fringe pattern equals the scattering-vector direction
+       of the corresponding FFT reflection (mod 180°), so the FFT angles of
+       the selected reflections can be used as targets directly.
+    3. **Hysteresis** — only *connected components* of the candidate mask
+       larger than ``min_remove_area_px`` are actually removed. Small
+       candidate specks (fringe gaps, single noisy pixels) survive.
+
+    Parameters
+    ----------
+    image : (H, W) grayscale array (uint8 or float).
+    grain_mask : (H, W) bool — the grain mask to clean.
+    sigma : structure tensor window (px). ~1.5× the lattice-fringe period;
+        3.0 is a good default for typical d-spacings of 2–8 px.
+    coherence_threshold : anisotropy below this = amorphous/textureless.
+    orientation_targets_deg : FFT angles (0–180°, mod 180) of the reflections
+        selected for this grain (the same convention as the app's FFT θ:
+        ``atan2(dr, dc) mod 180``). They are converted to the tensor frame
+        internally. Empty list = orientation gate disabled.
+    orientation_tolerance_deg : ± tolerance for the orientation gate.
+    min_remove_area_px : smallest connected candidate region that is removed.
+
+    Returns
+    -------
+    (cleaned_mask, diag)
+        cleaned_mask: (H, W) bool — grain minus removed regions.
+        diag: dict — removed_px, removed_frac, n_components_removed,
+        coherence_gate_px, orientation_gate_px, params echo.
+    """
+    diag: dict[str, Any] = {
+        "removed_px": 0,
+        "removed_frac": 0.0,
+        "n_components_removed": 0,
+        "coherence_gate_px": 0,
+        "orientation_gate_px": 0,
+        "sigma": float(sigma),
+        "coherence_threshold": float(coherence_threshold),
+        "orientation_tolerance_deg": float(orientation_tolerance_deg),
+        "min_remove_area_px": int(min_remove_area_px),
+        "orientation_gate_applied": False,
+    }
+    mask = np.asarray(grain_mask, dtype=bool)
+    if not mask.any():
+        return mask, diag
+
+    img = np.asarray(image)
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    img = img.astype(np.float64)
+
+    orientation_deg, coherence, energy = _compute_structure_tensor(img, sigma)
+
+    inside = mask
+    # 1. Coherence gate: isotropic or textureless → amorphous/vacuum.
+    cand_coherence = inside & (coherence < coherence_threshold)
+
+    # 2. Orientation gate: textured pixels whose fringe direction matches
+    #    none of the selected reflections. Only applied where the local
+    #    texture is strong enough to give a meaningful orientation.
+    cand_orientation = np.zeros_like(mask)
+    targets = [float(t) % 180.0 for t in (orientation_targets_deg or [])
+               if np.isfinite(t)]
+    if targets and orientation_tolerance_deg > 0:
+        # Energy guard: skip the orientation test where the gradient energy is
+        # negligible (textureless), because the orientation estimate there is
+        # noise. The floor is RELATIVE to the strongest texture inside the
+        # mask — a quantile of the mask's energy would fail when the mask
+        # contains only strongly-textured pixels (the quantile would then sit
+        # at full texture energy and wrongly exempt a quarter of the pixels).
+        energy_floor = 0.05 * float(np.max(energy[inside]))
+        textured = inside & (energy >= max(energy_floor, 1e-9))
+        if textured.any():
+            # Convert the tensor orientation into the FFT angle frame.
+            # Convention check (empirical + analytic): for a fringe pattern
+            # whose FFT reflection sits at angle theta = atan2(dr, dc), the
+            # tensor orientation (skimage order='xy', x = columns) is
+            # (90° − theta) mod 180. Verified for theta = 0/30/60/90°.
+            ang_fft = np.mod(90.0 - orientation_deg, 180.0)
+            min_diff = np.full(ang_fft.shape, 180.0)
+            for t in targets:
+                d = np.abs(ang_fft - t)
+                d = np.minimum(d, 180.0 - d)  # axial distance mod 180°
+                min_diff = np.minimum(min_diff, d)
+            cand_orientation = textured & (min_diff > orientation_tolerance_deg)
+            diag["orientation_gate_applied"] = True
+
+    candidates = cand_coherence | cand_orientation
+    diag["coherence_gate_px"] = int(cand_coherence.sum())
+    diag["orientation_gate_px"] = int((cand_orientation & ~cand_coherence).sum())
+
+    # 3. Hysteresis: remove only sufficiently large connected components.
+    cleaned = mask.copy()
+    if candidates.any():
+        lbl, n = ndi.label(candidates.astype(np.int32))
+        if n > 0:
+            areas = np.bincount(lbl.ravel())
+            areas[0] = 0  # background
+            to_remove = np.where(areas >= min_remove_area_px)[0]
+            if len(to_remove) > 0:
+                remove_mask = np.isin(lbl, to_remove) & inside
+                cleaned = mask & ~remove_mask
+                diag["n_components_removed"] = int(len(to_remove))
+                diag["removed_px"] = int(remove_mask.sum())
+                diag["removed_frac"] = float(
+                    remove_mask.sum() / max(mask.sum(), 1))
+
+    diag["final_area_px"] = int(cleaned.sum())
+    # Safety net: if the cleanup removed (almost) everything, the FFT seed
+    # found *something* — it is far more likely that the cleanup thresholds
+    # are too aggressive for this image than that the whole grain is vacuum.
+    # A few stray survivors below 10% of the original area are treated the
+    # same way (they would produce a meaningless speck of a grain).
+    if mask.any() and cleaned.sum() < 0.10 * mask.sum():
+        diag["note"] = (f"cleanup would remove {100 * (1 - cleaned.sum() / mask.sum()):.0f}% "
+                        f"of the grain — thresholds likely too aggressive; "
+                        f"original mask kept")
+        return mask, diag
+    return cleaned, diag
 
 
 def _quantise_orientation(orientation_deg: np.ndarray, n_bins: int

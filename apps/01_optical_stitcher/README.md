@@ -95,7 +95,9 @@ a precise `Expected overlap` prior:
    If two neighbouring shots were captured **without any overlap**, tick
    **No overlap (black gap)** instead — the pair is placed side by side with a visible
    black band on the panorama (gap width configurable in Step 2; unticking restores
-   the previous position). Such a pair counts as approved.
+   the previous position). Such a pair counts as approved. The black band is pure
+   black with crisp image borders — multi-band blending cannot bleed darkness into
+   the tiles next to the gap.
 3. **Adjust** — unticked pairs get nudge buttons (1–100 px steps) and numeric dx/dy
    inputs with a live overlay. Increasing `dx` moves the tiles apart (less overlap).
 4. **Stitch** — the panorama is blended using exactly the reviewed positions;

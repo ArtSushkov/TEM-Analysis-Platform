@@ -178,6 +178,13 @@ def blend_tiles(
     Pixels not covered by any tile (zero coverage — e.g. the black gap of a
     "no overlap" pair or ragged canvas corners) are returned as pure black.
 
+    Gap-bleed guard: tiles bordering an uncovered gap keep FULL weight on
+    that side (hard_edges) AND are edge-extended into the gap before the
+    pyramid accumulation (see Step 0b). Without the extension, the Laplacian
+    pyramid reconstruction (cv2.pyrUp) pulls zeros from the uncovered gap
+    into neighbouring tile pixels at every level, producing a dark gradient
+    that eats ~10-20 px into the tiles on both sides of the gap.
+
     Returns: BGR uint8 HxWx3.
     """
     canvas_h, canvas_w = canvas_size
@@ -201,7 +208,47 @@ def blend_tiles(
     else:
         compensated_uint8 = [t.image for t in placed]
 
+    # === Step 0b: edge-extend hard-edge tiles into the adjacent gap ===
+    # cv2.pyrUp interpolates each pyramid level from its neighbours. An
+    # interior UNCOVERED region (the black gap of a "no overlap" pair)
+    # therefore leaks zeros into adjacent tile pixels at every pyramid
+    # level; the errors accumulate level by level into a visible dark
+    # gradient (~10-20 px) on both sides of the gap.
+    # Fix: replicate the tile's border columns into the adjacent gap on the
+    # hard-edge sides, so pyramid content is continuous there. Coverage
+    # (Step 1) is computed from the ORIGINAL tile rectangles, and the final
+    # step forces all uncovered pixels back to pure black — the padded
+    # content never reaches the output.
+    MAX_GAP_PAD = 4096  # sanity cap for pathologically large manual gaps
+    images_blend: List[np.ndarray] = list(compensated_uint8)
+    gap_pads: List[Tuple[int, int]] = []      # (pad_left, pad_right) per tile
+    for k, tile in enumerate(placed):
+        hl, hr, _, _ = tile.hard_edges
+        # NOTE: pad sizes are computed from the ORIGINAL tile widths
+        # (compensated_uint8), so BOTH tiles of a gap extend across the full
+        # gap independently — the second tile must not "lose" its pad just
+        # because the first tile's pad already covers the gap.
+        pad_l = pad_r = 0
+        if hr and k + 1 < len(placed):
+            pad_r = max(0, min(
+                placed[k + 1].offset_x
+                - (tile.offset_x + compensated_uint8[k].shape[1]),
+                MAX_GAP_PAD))
+        if hl and k >= 1:
+            pad_l = max(0, min(
+                tile.offset_x - (placed[k - 1].offset_x
+                                 + compensated_uint8[k - 1].shape[1]),
+                MAX_GAP_PAD))
+        gap_pads.append((pad_l, pad_r))
+        if pad_l or pad_r:
+            images_blend[k] = np.pad(
+                images_blend[k], ((0, 0), (pad_l, pad_r), (0, 0)), mode="edge")
+
     # === Step 1: Compute coverage (one canvas-sized array, uint8) ===
+    # NOTE: computed from the ORIGINAL tile rectangles (tile.image), NOT the
+    # gap-padded copies above — the padded strip must never count as
+    # covered, otherwise the black gap would be filled with replicated
+    # image content.
     coverage_count = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
     for tile in placed:
         th, tw = tile.image.shape[:2]
@@ -222,9 +269,13 @@ def blend_tiles(
         canvas_weights.append(np.zeros((h_l, w_l), dtype=np.float32))
 
     # === Step 3: Process tiles one by one (minimum memory!) ===
-    for tile, img_compensated in zip(placed, compensated_uint8):
+    for k_tile, (tile, img_compensated) in enumerate(zip(placed, images_blend)):
         th, tw = img_compensated.shape[:2]
-        x0, y0 = tile.offset_x, tile.offset_y
+        # A left pad (gap_pads[k][0]) prepends columns to the array, so the
+        # placement origin moves LEFT by the same amount — otherwise the
+        # tile's real content would be shifted right on the canvas.
+        x0 = tile.offset_x - gap_pads[k_tile][0]
+        y0 = tile.offset_y
         x1, y1 = min(x0 + tw, canvas_w), min(y0 + th, canvas_h)
         actual_w = x1 - x0
         actual_h = y1 - y0
@@ -237,7 +288,14 @@ def blend_tiles(
         # Weight mask in tile size
         hl, hr, ht, hb = tile.hard_edges
         if tile.weight is not None:
-            tile_weight = tile.weight[:actual_h, :actual_w].astype(np.float32)
+            # Align a precomputed weight with the gap-padded image: slice to
+            # the tile's OWN original size first, then replicate the border
+            # columns into the padded zone.
+            w_src = tile.weight[:tile.image.shape[0], :tile.image.shape[1]]
+            pl, pr = gap_pads[k_tile]
+            if pl or pr:
+                w_src = np.pad(w_src, ((0, 0), (pl, pr)), mode="edge")
+            tile_weight = w_src[:actual_h, :actual_w].astype(np.float32)
             if use_focus_weights and gamma_correction != 1.0:
                 tile_weight = tile_weight ** gamma_correction
         elif use_focus_weights:

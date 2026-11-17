@@ -33,6 +33,73 @@ st.set_page_config(
 )
 
 
+# === Global CSS: keep the sidebar reliably scrollable ===
+#
+# Streamlit styles the sidebar scrollbar as a thin overlay that only appears
+# on hover. Make it always visible and force the scroll container to scroll.
+
+st.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+        overflow-y: auto !important;
+        scrollbar-width: auto;          /* Firefox: full-width scrollbar */
+        scrollbar-gutter: stable;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar {
+        width: 10px;                     /* Chromium/WebKit: always visible */
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar-thumb {
+        background: rgba(128, 128, 128, 0.55);
+        border-radius: 6px;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar-track {
+        background: rgba(128, 128, 128, 0.12);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# === Navigation ===
+#
+# Why not st.tabs? Streamlit evaluates the bodies of *all* tabs on every
+# rerun (heavy content included), so switching recomputed hidden sections.
+# With an explicit navigation widget only the active section's main content
+# renders. The SIDEBAR is different: it is shared by all tabs and rendered
+# on every run (see render_sidebar). It used to live inside the Stitcher
+# renderer only — on Pair Review/Help the sidebar was then empty (nowhere
+# to upload, although the info box told the user to "upload in the
+# sidebar"), and Streamlit deleted the uploaded-file session state because
+# the uploader widgets stopped rendering. The always-on sidebar fixes both.
+
+NAV_TABS = ["Stitcher", "Pair Review", "Help"]
+
+
+def _render_navigation() -> str:
+    """Render the top navigation and return the active section name."""
+    if hasattr(st, "segmented_control"):
+        # Streamlit >= 1.40: pill-style control that looks like tabs.
+        extra_kwargs = {}
+        if "nav_seg" not in st.session_state:
+            extra_kwargs["default"] = st.session_state.get("nav_tab", NAV_TABS[0])
+        nav = st.segmented_control(
+            "App section", NAV_TABS, selection_mode="single",
+            key="nav_seg", label_visibility="collapsed",
+            **extra_kwargs,
+        )
+    else:
+        nav = st.radio(
+            "App section", NAV_TABS, horizontal=True,
+            key="nav_seg", label_visibility="collapsed",
+        )
+    if not nav:  # segmented_control allows deselecting the current pill
+        nav = st.session_state.get("nav_tab", NAV_TABS[0])
+    st.session_state.nav_tab = nav
+    return nav
+
+
 def _param(key: str, default):
     """Read a sidebar widget value from session state (shared across tabs)."""
     return st.session_state.get(key, default)
@@ -631,15 +698,22 @@ def render_help_tab():
     )
 
 
-def render_stitcher_tab():
-    """Render the main Stitcher tab."""
-    st.title("Microscope Image Stitcher")
-    st.caption(
-        "Upload a series of images with `_N` suffix (N = sequential index). "
-        "The app automatically determines their relative positions and stitches a panorama."
-    )
+def render_sidebar() -> None:
+    """Render the shared sidebar (Upload + Method Settings) on EVERY tab.
 
-    # === Sidebar: settings ===
+    Why always render it:
+    1. Streamlit deletes a widget's session-state entry when the widget is
+       not rendered in the current run. With the Upload expander living only
+       in the Stitcher renderer, switching to Pair Review (a) left the
+       sidebar completely empty — although the main area said "Upload images
+       or a ZIP archive in the sidebar to begin" — and (b) silently wiped
+       the already-uploaded files, so going back to Stitcher showed the
+       empty upload again.
+    2. Pair Review's Step 4 stitches with the Method Settings read via
+       ``_param()``; if those widgets do not render, the defaults are used
+       and the user cannot change them. Always-on sidebar makes the settings
+       genuinely shared between the Stitcher and Pair Review workflows.
+    """
     st.sidebar.header("Method Settings")
 
     with st.sidebar.expander("Upload", expanded=True):
@@ -649,24 +723,25 @@ def render_stitcher_tab():
             index=0,
             key="upload_mode",
         )
-        uploaded_files = st.file_uploader(
-            "Select images",
-            type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
-            accept_multiple_files=True,
-            label_visibility="collapsed",
-            key="uploaded_files",
-        ) if upload_mode == "Multiple files" else None
-
-        uploaded_zip = st.file_uploader(
-            "Select ZIP archive",
-            type=["zip"],
-            accept_multiple_files=False,
-            label_visibility="collapsed",
-            key="uploaded_zip",
-        ) if upload_mode == "ZIP archive" else None
+        if upload_mode == "Multiple files":
+            st.file_uploader(
+                "Select images",
+                type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
+                accept_multiple_files=True,
+                label_visibility="collapsed",
+                key="uploaded_files",
+            )
+        else:
+            st.file_uploader(
+                "Select ZIP archive",
+                type=["zip"],
+                accept_multiple_files=False,
+                label_visibility="collapsed",
+                key="uploaded_zip",
+            )
 
     with st.sidebar.expander("Capture (optional)", expanded=False):
-        expected_overlap = st.slider(
+        st.slider(
             "Expected overlap between adjacent frames (%)", 0, 80, 0, step=5,
             key="expected_overlap",
             help="Approximate overlap you aim for when capturing a row of "
@@ -676,75 +751,88 @@ def render_stitcher_tab():
                  "this overlap. 0 = unknown — fully automatic.")
 
     with st.sidebar.expander("Feature Detection", expanded=True):
-        n_features = st.slider("SIFT features (per tile)", 500, 10000, 5000, step=500,
-                                key="n_features",
-                                help="More = more robust but slower. 5000 is a good balance.")
-        ratio_thresh = st.slider("Lowe ratio threshold", 0.5, 0.9, 0.75, step=0.05,
-                                  key="ratio_thresh",
-                                  help="Lower = stricter match filtering. 0.75 is standard.")
-        ransac_thresh = st.slider("RANSAC reprojection threshold (px)", 1.0, 15.0, 5.0, step=0.5,
-                                   key="ransac_thresh",
-                                   help="Allowed inlier error. 5 px is standard.")
-        min_inliers = st.slider("Min inliers for SIFT", 4, 50, 8, step=1,
-                                 key="min_inliers",
-                                 help="Below this — fall back to alternative methods.")
+        st.slider("SIFT features (per tile)", 500, 10000, 5000, step=500,
+                  key="n_features",
+                  help="More = more robust but slower. 5000 is a good balance.")
+        st.slider("Lowe ratio threshold", 0.5, 0.9, 0.75, step=0.05,
+                  key="ratio_thresh",
+                  help="Lower = stricter match filtering. 0.75 is standard.")
+        st.slider("RANSAC reprojection threshold (px)", 1.0, 15.0, 5.0, step=0.5,
+                  key="ransac_thresh",
+                  help="Allowed inlier error. 5 px is standard.")
+        st.slider("Min inliers for SIFT", 4, 50, 8, step=1,
+                  key="min_inliers",
+                  help="Below this — fall back to alternative methods.")
 
     with st.sidebar.expander("Preprocessing", expanded=False):
-        use_clahe = st.checkbox("Apply CLAHE (recommended)", value=True,
-                                 key="use_clahe",
-                                 help="Adaptive histogram equalization. Critical for dark microscope images.")
-        clahe_clip = st.slider("CLAHE clip limit", 1.0, 8.0, 3.0, step=0.5, key="clahe_clip")
+        st.checkbox("Apply CLAHE (recommended)", value=True,
+                    key="use_clahe",
+                    help="Adaptive histogram equalization. Critical for dark microscope images.")
+        st.slider("CLAHE clip limit", 1.0, 8.0, 3.0, step=0.5, key="clahe_clip")
 
     with st.sidebar.expander("Blending", expanded=False):
-        blend_levels = st.slider("Laplacian pyramid levels", 2, 8, 5, step=1,
-                                  key="blend_levels",
-                                  help="More = smoother seams but slower.")
-        blend_feather = st.slider("Feather zone width (px)", 0, 200, 64, step=8,
-                                   key="blend_feather",
-                                   help="Smooth mask falloff toward tile edges.")
-        use_focus_weights = st.checkbox("Use focus-weighted mask", value=False,
-                                         key="use_focus_weights",
-                                         help="Weighting by sharpness map. "
-                                              "OFF (default) — simple feather mask, more stable on dark images. "
-                                              "ON — better for tiles with blurred edges.")
-        blend_gamma = st.slider("Gamma for focus weights", 0.5, 3.0, 1.5, step=0.1,
-                                 key="blend_gamma",
-                                 help=">1 — sharp zones dominate more. "
-                                      "Only used when focus-weighted mask is enabled.")
-        gain_strength = st.slider("Gain compensation", 0.0, 1.0, 0.8, step=0.1,
-                                   key="gain_strength",
-                                   help="Brightness equalization between tiles. "
-                                        "0 = off, 1 = full correction.")
+        st.slider("Laplacian pyramid levels", 2, 8, 5, step=1,
+                  key="blend_levels",
+                  help="More = smoother seams but slower.")
+        st.slider("Feather zone width (px)", 0, 200, 64, step=8,
+                  key="blend_feather",
+                  help="Smooth mask falloff toward tile edges.")
+        st.checkbox("Use focus-weighted mask", value=False,
+                    key="use_focus_weights",
+                    help="Weighting by sharpness map. "
+                         "OFF (default) — simple feather mask, more stable on dark images. "
+                         "ON — better for tiles with blurred edges.")
+        st.slider("Gamma for focus weights", 0.5, 3.0, 1.5, step=0.1,
+                  key="blend_gamma",
+                  help=">1 — sharp zones dominate more. "
+                       "Only used when focus-weighted mask is enabled.")
+        st.slider("Gain compensation", 0.0, 1.0, 0.8, step=0.1,
+                  key="gain_strength",
+                  help="Brightness equalization between tiles. "
+                       "0 = off, 1 = full correction.")
 
     with st.sidebar.expander("Backup Methods", expanded=False):
-        enable_phase = st.checkbox("Phase correlation fallback", value=True, key="enable_phase")
-        enable_ncc = st.checkbox("NCC scan fallback (slow)", value=True, key="enable_ncc")
+        st.checkbox("Phase correlation fallback", value=True, key="enable_phase")
+        st.checkbox("NCC scan fallback (slow)", value=True, key="enable_ncc")
 
     with st.sidebar.expander("Alignment Verification", expanded=False):
-        verify_with_ncc = st.checkbox(
+        st.checkbox(
             "Verify SIFT with NCC scan", value=True, key="verify_with_ncc",
             help="Cross-checks every SIFT result against a global correlation scan. "
                  "Protects against wrong SIFT consensus on samples with repetitive "
                  "scratches or dust dots. Recommended ON. Adds a few seconds per pair.")
-        ncc_verify_gap = st.slider(
+        st.slider(
             "Rejection score gap", 0.02, 0.15, 0.07, step=0.01, key="ncc_verify_gap",
             help="SIFT is rejected when the NCC scan finds an alignment better "
                  "by this margin. 0.07 is a balanced value.")
-        suppress_fixed_pattern = st.checkbox(
+        st.checkbox(
             "Suppress dust / fixed-pattern matches", value=True,
             key="suppress_fixed_pattern",
             help="Dust on the optics stays at the same pixel position in every "
                  "frame. Matches between such artifacts vote for a ~zero shift "
                  "and can corrupt RANSAC — they are dropped automatically.")
-        enable_drift_guard = st.checkbox(
+        st.checkbox(
             "Vertical drift guard", value=True, key="enable_drift_guard",
             help="Detects pairs whose vertical shift deviates sharply from the "
                  "row-wide drift trend and re-verifies them with a constrained "
                  "correlation scan. Fixes single frames shifted up or down.")
 
     with st.sidebar.expander("Output Format", expanded=False):
-        out_format = st.selectbox("Output format", ["PNG", "TIFF (LZW)", "JPEG"], index=0,
-                                  key="out_format")
+        st.selectbox("Output format", ["PNG", "TIFF (LZW)", "JPEG"], index=0,
+                     key="out_format")
+
+
+def render_stitcher_tab():
+    """Render the main Stitcher tab.
+
+    The sidebar (Upload + Method Settings) is rendered separately by
+    ``render_sidebar()`` and is shared with the Pair Review tab.
+    """
+    st.title("Microscope Image Stitcher")
+    st.caption(
+        "Upload a series of images with `_N` suffix (N = sequential index). "
+        "The app automatically determines their relative positions and stitches a panorama."
+    )
 
     # === Main content ===
     tiles, load_error = _get_tiles_cached()
@@ -801,29 +889,29 @@ def render_stitcher_tab():
     def update_progress(msg, p):
         progress.progress(min(max(p, 0.0), 1.0), msg)
 
-    # Run stitching
+    # Run stitching (settings come from the shared sidebar via _param)
     try:
+        eo = _param("expected_overlap", 0)
         result = pipeline.stitch_row(
             tiles,
-            n_features=n_features,
-            ratio_thresh=ratio_thresh,
-            ransac_thresh=ransac_thresh,
-            use_clahe=use_clahe,
-            clahe_clip=clahe_clip,
-            min_inliers_sift=min_inliers,
-            enable_phase_fallback=enable_phase,
-            enable_ncc_fallback=enable_ncc,
-            verify_with_ncc=verify_with_ncc,
-            ncc_verify_gap=ncc_verify_gap,
-            suppress_fixed_pattern=suppress_fixed_pattern,
-            enable_drift_guard=enable_drift_guard,
-            expected_overlap_pct=(expected_overlap if expected_overlap > 0
-                                  else None),
-            blend_levels=blend_levels,
-            blend_feather=blend_feather,
-            blend_gamma=blend_gamma,
-            blend_gain_strength=gain_strength,
-            blend_use_focus_weights=use_focus_weights,
+            n_features=_param("n_features", 5000),
+            ratio_thresh=_param("ratio_thresh", 0.75),
+            ransac_thresh=_param("ransac_thresh", 5.0),
+            use_clahe=_param("use_clahe", True),
+            clahe_clip=_param("clahe_clip", 3.0),
+            min_inliers_sift=_param("min_inliers", 8),
+            enable_phase_fallback=_param("enable_phase", True),
+            enable_ncc_fallback=_param("enable_ncc", True),
+            verify_with_ncc=_param("verify_with_ncc", True),
+            ncc_verify_gap=_param("ncc_verify_gap", 0.07),
+            suppress_fixed_pattern=_param("suppress_fixed_pattern", True),
+            enable_drift_guard=_param("enable_drift_guard", True),
+            expected_overlap_pct=(eo if eo > 0 else None),
+            blend_levels=_param("blend_levels", 5),
+            blend_feather=_param("blend_feather", 64),
+            blend_gamma=_param("blend_gamma", 1.5),
+            blend_gain_strength=_param("gain_strength", 0.8),
+            blend_use_focus_weights=_param("use_focus_weights", False),
             progress_callback=update_progress,
         )
     except Exception as e:
@@ -1299,14 +1387,13 @@ def render_pair_review_tab():
         render_stitch_result(result, tiles)
 
 
-# === Render the tabs ===
-tab_stitcher, tab_review, tab_help = st.tabs(["Stitcher", "Pair Review", "Help"])
+# === Render the active section ===
 
-with tab_stitcher:
+nav_tab = _render_navigation()
+render_sidebar()  # shared by ALL tabs — upload + method settings
+if nav_tab == "Stitcher":
     render_stitcher_tab()
-
-with tab_review:
+elif nav_tab == "Pair Review":
     render_pair_review_tab()
-
-with tab_help:
+else:
     render_help_tab()

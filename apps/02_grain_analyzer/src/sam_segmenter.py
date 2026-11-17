@@ -92,8 +92,9 @@ MODEL_REGISTRY: dict[str, dict] = {
     },
 }
 
-# Default model: vanilla SAM ViT-B (backward-compatible, no surprise downloads).
-DEFAULT_MODEL_KEY = "sam_vit_b"
+# Default model: Micro-SAM ViT-B LM (fine-tuned on microscopy — better
+# TEM-layer masks than vanilla SAM, same ~350 MB size class as sam_vit_b).
+DEFAULT_MODEL_KEY = "microsam_vit_b_lm"
 
 # Default cache directory for checkpoints.
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "tem_grain_analyzer"

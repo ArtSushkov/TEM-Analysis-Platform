@@ -1,7 +1,7 @@
 """
 app.py — Streamlit UI for TEM cross-section grain-size analysis.
 
-Three tabs:
+Three sections (navigation pills at the top of the page):
 1. **Single Image** — upload one TIFF, select a layer (SAM / polygon / manual rows),
    analyse grains, download a self-contained JSON report.
 2. **Batch Statistics** — drop several JSON reports (or a ZIP), get pooled
@@ -11,6 +11,7 @@ Three tabs:
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tempfile
 import zipfile
@@ -53,6 +54,38 @@ st.set_page_config(
     page_icon=":microscope:",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+
+# === Global CSS: keep the sidebar reliably scrollable ===
+#
+# Streamlit styles the sidebar scrollbar as a thin overlay that only appears
+# on hover (scrollbar-width: thin). On a long sidebar it is easy to miss, and
+# on some browsers (notably Firefox builds) it may not appear at all, which
+# makes the bottom of the sidebar unreachable by mouse wheel alone. Make the
+# scrollbar always visible and force the scroll container to scroll.
+
+st.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+        overflow-y: auto !important;
+        scrollbar-width: auto;          /* Firefox: full-width scrollbar */
+        scrollbar-gutter: stable;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar {
+        width: 10px;                     /* Chromium/WebKit: always visible */
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar-thumb {
+        background: rgba(128, 128, 128, 0.55);
+        border-radius: 6px;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarContent"]::-webkit-scrollbar-track {
+        background: rgba(128, 128, 128, 0.12);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -168,6 +201,42 @@ def _draw_mask_on_image(image_rgb: np.ndarray, mask: np.ndarray,
     return out
 
 
+# === Navigation ===
+#
+# Why not st.tabs? Streamlit evaluates the bodies of *all* tabs on every
+# rerun. Every tab added its own widgets to the sidebar, so the sidebar
+# became the union of all three sections — several viewport-heights tall —
+# and "Upload Reports" ended up buried at the very bottom of it. With an
+# explicit navigation widget only the active section renders: the sidebar
+# stays short (the Batch section's sidebar is just "Upload Reports") and
+# switching no longer recomputes hidden section content.
+
+NAV_TABS = ["Single Image", "Batch Statistics", "Help"]
+
+
+def _render_navigation() -> str:
+    """Render the top navigation and return the active section name."""
+    if hasattr(st, "segmented_control"):
+        # Streamlit >= 1.40: pill-style control that looks like tabs.
+        extra_kwargs = {}
+        if "nav_seg" not in st.session_state:
+            extra_kwargs["default"] = st.session_state.get("nav_tab", NAV_TABS[0])
+        nav = st.segmented_control(
+            "App section", NAV_TABS, selection_mode="single",
+            key="nav_seg", label_visibility="collapsed",
+            **extra_kwargs,
+        )
+    else:
+        nav = st.radio(
+            "App section", NAV_TABS, horizontal=True,
+            key="nav_seg", label_visibility="collapsed",
+        )
+    if not nav:  # segmented_control allows deselecting the current pill
+        nav = st.session_state.get("nav_tab", NAV_TABS[0])
+    st.session_state.nav_tab = nav
+    return nav
+
+
 # === Single Image tab ===
 
 def render_single_image_tab() -> None:
@@ -242,7 +311,7 @@ def render_single_image_tab() -> None:
             "4. **Output** — colour-labeled grain map, boundary overlay, statistics "
             "table, histograms with lognormal fit, and a self-contained JSON report."
         )
-        st.markdown("See the **Help** tab for the full guide.")
+        st.markdown("See the **Help** section for the full guide.")
         return
 
     # === Metadata panel ===
@@ -262,10 +331,14 @@ def render_single_image_tab() -> None:
         if md.software:
             st.write(f"**Software:** {md.software}")
         with st.expander("Override pixel size", expanded=False):
+            # Clamp into the input range: a corrupt/unusual XResolution tag can
+            # yield absurd pixel sizes, and an out-of-range value would crash the
+            # sidebar render with StreamlitValueAboveMaxError.
+            ps_clamped = min(max(float(md.pixel_size_nm), 0.0001), 100.0)
             new_ps = st.number_input(
                 "Pixel size (nm/px)",
                 min_value=0.0001, max_value=100.0,
-                value=float(md.pixel_size_nm),
+                value=ps_clamped,
                 format="%.4f",
                 key="manual_ps_input",
             )
@@ -517,6 +590,49 @@ def render_single_image_tab() -> None:
                 help="Min area (in original-image pixels) for a region to "
                      "qualify as a separate grain (used by auto-find similar).",
             )
+            click_params_obj.use_structure_cleanup = st.checkbox(
+                "Structure tensor cleanup (remove amorphous pixels)",
+                value=False,
+                key="click_stcleanup",
+                help="After region growing, judge every grain pixel with the "
+                     "structure tensor and remove: (1) amorphous/textureless "
+                     "regions — local texture is isotropic or flat (coherence "
+                     "below threshold); (2) textured regions whose fringe "
+                     "direction does not match ANY of the grain's reflections "
+                     "(within tolerance). Only connected regions larger than "
+                     "'Min cleanup region' are actually removed (hysteresis), "
+                     "so fringe gaps and single noisy pixels survive.",
+            )
+            if click_params_obj.use_structure_cleanup:
+                click_params_obj.cleanup_sigma_px = st.slider(
+                    "Cleanup σ (px)", 1.0, 10.0, 3.0, 0.5,
+                    key="click_stsigma",
+                    help="Structure tensor window. ~1.5× the lattice-fringe "
+                         "period in pixels.",
+                )
+                click_params_obj.cleanup_coherence_threshold = st.slider(
+                    "Cleanup coherence threshold", 0.05, 0.90, 0.35, 0.05,
+                    key="click_stcoh",
+                    help="Anisotropy of the local texture: 1.0 = clear lattice "
+                         "fringes (crystalline), 0.0 = isotropic speckle or "
+                         "flat area (amorphous/vacuum). Pixels below this "
+                         "are removed.",
+                )
+                click_params_obj.cleanup_orientation_tolerance_deg = st.slider(
+                    "Cleanup orientation tolerance (°)", 0.0, 45.0, 25.0, 5.0,
+                    key="click_sttol",
+                    help="Textured pixels whose fringe direction differs from "
+                         "ALL of the grain's reflections by more than this "
+                         "are removed. 0 = disable the orientation gate "
+                         "(coherence-only cleanup).",
+                )
+                click_params_obj.cleanup_min_remove_area_px = st.slider(
+                    "Min cleanup region (px)", 5, 500, 25, 5,
+                    key="click_stmin",
+                    help="Only connected candidate regions larger than this "
+                         "are removed. Smaller specks survive (protects "
+                         "fringe gaps and noise).",
+                )
             st.session_state._click_params = click_params_obj
             # No 'params' alias needed — click mode has its own analyze path.
         elif seg_method == "Structure tensor (auto-assist)":
@@ -524,9 +640,9 @@ def render_single_image_tab() -> None:
             st_params.sigma = st.slider("Sigma (window size, px)", 1.0, 20.0, 5.0, 0.5,
                                          key="st_sigma",
                                          help="Structure tensor window. ~1.5× lattice-fringe period. Larger = smoother, smaller = noisier.")
-            st_params.coherence_threshold = st.slider("Coherence threshold", 0.01, 0.50, 0.15, 0.01,
+            st_params.coherence_threshold = st.slider("Coherence threshold", 0.05, 0.90, 0.35, 0.05,
                                                        key="st_coh",
-                                                       help="Pixels with coherence < this = background. Lower = more grains found (including weak fringes).")
+                                                       help="Anisotropy of the local texture: 1.0 = clear lattice fringes (crystalline), 0.0 = isotropic amorphous speckle / flat area. Pixels with coherence < this = background. Lower = more grains found (including weak fringes).")
             st_params.orientation_median_filter_px = st.slider("Orientation smoothing (px)", 0, 15, 5, 1,
                                                                 key="st_smooth",
                                                                 help="Median filter on orientation map. Reduces noise → cleaner grain boundaries. 0 = off.")
@@ -1048,12 +1164,14 @@ def _render_sam_click_selector(li: io_utils.LoadedImage) -> None:
             "SAM model",
             model_keys,
             format_func=lambda k: model_options[k],
-            index=0,  # default: sam_vit_b
+            index=(model_keys.index(sam_segmenter.DEFAULT_MODEL_KEY)
+                   if sam_segmenter.DEFAULT_MODEL_KEY in model_keys else 0),
             key="sam_click_model",
-            help=("Vanilla SAM = Meta's original model (natural images). "
-                  "Micro-SAM = fine-tuned for microscopy (better for TEM). "
-                  "EM-organelles variant is recommended for electron microscopy. "
-                  "✓ = already downloaded; ⬇ = will download on first use."),
+            help=("Default = Micro-SAM ViT-B LM, fine-tuned on microscopy data "
+                  "(better TEM-layer masks than vanilla SAM of the same size). "
+                  "EM-organelles variants are tuned for electron-microscopy "
+                  "organelles; vanilla SAM = Meta's original model (natural "
+                  "images). ✓ = already downloaded; ⬇ = will download on first use."),
         )
         max_img_dim = st.slider(
             "Max image dimension (px)", 512, 2048, 1024, 64,
@@ -1198,12 +1316,14 @@ def _render_sam_auto_selector(li: io_utils.LoadedImage) -> None:
             "SAM model",
             model_keys,
             format_func=lambda k: model_options[k],
-            index=0,  # default: sam_vit_b
+            index=(model_keys.index(sam_segmenter.DEFAULT_MODEL_KEY)
+                   if sam_segmenter.DEFAULT_MODEL_KEY in model_keys else 0),
             key="sam_auto_model",
-            help=("Vanilla SAM = Meta's original model (natural images). "
-                  "Micro-SAM = fine-tuned for microscopy (better for TEM). "
-                  "EM-organelles variant is recommended for electron microscopy. "
-                  "✓ = already downloaded; ⬇ = will download on first use."),
+            help=("Default = Micro-SAM ViT-B LM, fine-tuned on microscopy data "
+                  "(better TEM-layer masks than vanilla SAM of the same size). "
+                  "EM-organelles variants are tuned for electron-microscopy "
+                  "organelles; vanilla SAM = Meta's original model (natural "
+                  "images). ✓ = already downloaded; ⬇ = will download on first use."),
         )
         max_img_dim = st.slider(
             "Max image dimension (px)", 512, 2048, 1024, 64,
@@ -1841,6 +1961,27 @@ def _render_click_segmentation_ui(li, md, selected_layer, ps) -> None:
                                 "status": {"good": "🟢", "borderline": "🟡", "noise": "🔴"}.get(q.status, "?"),
                             })
                         st.dataframe(sig_rows, use_container_width=True, hide_index=True)
+                    # Structure tensor cleanup diagnostics (if enabled).
+                    if getattr(last_result, "cleanup_diag", None):
+                        cd = last_result.cleanup_diag
+                        st.markdown("**Structure tensor cleanup**:")
+                        if cd.get("removed_px"):
+                            st.markdown(
+                                f"- Removed **{cd['removed_px']} px** "
+                                f"({cd['removed_frac'] * 100:.1f}% of the grown "
+                                f"grain) in {cd['n_components_removed']} region(s): "
+                                f"coherence gate {cd.get('coherence_gate_px', 0)} px, "
+                                f"orientation gate {cd.get('orientation_gate_px', 0)} px."
+                            )
+                        else:
+                            st.markdown("- Nothing removed — all grain pixels are "
+                                        "coherent and match the selected reflections.")
+                        if cd.get("note"):
+                            st.warning(f"  ⚠️ {cd['note']}")
+                        st.caption(f"σ={cd.get('sigma')} px, coherence thr={cd.get('coherence_threshold')}, "
+                                   f"orientation tol=±{cd.get('orientation_tolerance_deg')}° "
+                                   f"({'applied' if cd.get('orientation_gate_applied') else 'off'}), "
+                                   f"min region={cd.get('min_remove_area_px')} px.")
                     # Diagnostics for failed clicks.
                     if not last_result.success:
                         st.markdown("**Diagnostics:**")
@@ -3107,8 +3248,97 @@ def _render_analysis_results(md, selected_layer, ps) -> None:
     st.caption(
         "The JSON report is self-contained — per-grain measurements, statistics, "
         "segmentation parameters, layer polygon, and the labeled image (base64 PNG). "
-        "Drop several into the **Batch Statistics** tab to pool grain sizes."
+        "Drop several into the **Batch Statistics** section to pool grain sizes."
     )
+
+    # --- Export training data (for ML fine-tuning) ---
+    st.markdown("---")
+    st.subheader("Export Training Data (for ML)")
+    st.caption("Save the layer image + grain labels as TIFF files for training "
+               "Micro-SAM (layer detection) or U-Net (grain segmentation). "
+               "Collect ~10-50 such exports to build a training dataset. "
+               "The grain ZIP includes a layer mask: the notebook excludes "
+               "out-of-layer pixels from the loss via ignore_index.")
+    col_td1, col_td2 = st.columns(2)
+    with col_td1:
+        # Layer detection: full image + binary layer mask + click point.
+        li_td = st.session_state.loaded_image
+        # Use imencode to get bytes.
+        _, img_enc = cv2.imencode(".tif", li_td.image if li_td.image.ndim == 2 else cv2.cvtColor(li_td.image, cv2.COLOR_RGB2GRAY))
+        layer_mask_uint8 = (selected_layer.mask.astype(np.uint8) * 255)
+        _, mask_enc = cv2.imencode(".tif", layer_mask_uint8)
+        # Combine into a zip.
+        td_zip = io.BytesIO()
+        import zipfile as zf
+        with zf.ZipFile(td_zip, "w") as z:
+            z.writestr("layer_image.tif", img_enc.tobytes())
+            z.writestr("layer_mask.tif", mask_enc.tobytes())
+            # Click point = centroid of the layer mask.
+            rows, cols = np.where(selected_layer.mask)
+            if len(rows) > 0:
+                click_r = int(np.mean(rows))
+                click_c = int(np.mean(cols))
+            else:
+                click_r, click_c = 0, 0
+            z.writestr("click_point.json",
+                        json.dumps({"col": click_c, "row": click_r}))
+        td_fname = Path(md.file_name).stem + "_layer_training.zip"
+        st.download_button(
+            label="Layer detection data (image + mask + click point)",
+            data=td_zip.getvalue(), file_name=td_fname, mime="application/zip",
+            key="dl_layer_training",
+        )
+    with col_td2:
+        # Grain segmentation: cropped layer image + labels + boundaries + layer mask.
+        rmin, cmin, rmax, cmax = result.bbox
+        cropped = li_td.image[rmin:rmax, cmin:cmax]
+        labels = result.labels
+        # Pixels OUTSIDE the layer (neighboring layers caught by the tilted-layer
+        # bbox) are left as-is and shipped separately in grain_layer_mask.tif:
+        # the U-Net notebook marks them with ignore_index=255 and excludes them
+        # from the loss. (Previously they were mean-filled here; the fill is no
+        # longer needed and hiding real texture made the export less honest.)
+        cropped_mask = selected_layer.mask[rmin:rmax, cmin:cmax]
+        if cropped_mask.shape == cropped.shape[:2]:
+            layer_mask_u8 = cropped_mask.astype(np.uint8) * 255
+        else:  # defensive: shapes always match by construction
+            layer_mask_u8 = np.ones(cropped.shape[:2], dtype=np.uint8) * 255
+        boundaries = np.zeros_like(labels, dtype=np.uint8)
+        if labels.max() > 0:
+            for shift in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+                shifted = np.roll(labels, shift, axis=(0, 1))
+                # Boundary between different grains.
+                boundaries |= ((labels != shifted) & (labels > 0) & (shifted > 0)).astype(np.uint8)
+                # Edge of grains (grain next to background).
+                boundaries |= ((labels > 0) & (shifted == 0)).astype(np.uint8)
+                boundaries |= ((labels == 0) & (shifted > 0)).astype(np.uint8)
+            boundaries = boundaries * 255
+        _, crop_enc = cv2.imencode(".tif", cropped if cropped.ndim == 2 else cv2.cvtColor(cropped, cv2.COLOR_RGB2GRAY))
+        _, lbl_enc = cv2.imencode(".tif", labels.astype(np.uint16))
+        _, bnd_enc = cv2.imencode(".tif", boundaries)
+        _, glayer_mask_enc = cv2.imencode(".tif", layer_mask_u8)
+        # Also create a colorized PNG of labels for easy viewing (uint16 TIFF can't
+        # be opened in standard image viewers).
+        from skimage import color as skcolor
+        if labels.max() > 0:
+            colored_labels = skcolor.label2rgb(labels, bg_label=0, kind="overlay", alpha=0.7)
+            colored_labels = (colored_labels * 255).astype(np.uint8)
+        else:
+            colored_labels = np.zeros((labels.shape[0], labels.shape[1], 3), dtype=np.uint8)
+        _, lbl_png_enc = cv2.imencode(".png", cv2.cvtColor(colored_labels, cv2.COLOR_RGB2BGR))
+        grain_zip = io.BytesIO()
+        with zf.ZipFile(grain_zip, "w") as z:
+            z.writestr("grain_image.tif", crop_enc.tobytes())
+            z.writestr("grain_labels.tif", lbl_enc.tobytes())
+            z.writestr("grain_labels_preview.png", lbl_png_enc.tobytes())
+            z.writestr("grain_boundaries.tif", bnd_enc.tobytes())
+            z.writestr("grain_layer_mask.tif", glayer_mask_enc.tobytes())
+        grain_fname = Path(md.file_name).stem + "_grain_training.zip"
+        st.download_button(
+            label="Grain segmentation data (image + labels + boundaries + layer mask)",
+            data=grain_zip.getvalue(), file_name=grain_fname, mime="application/zip",
+            key="dl_grain_training",
+        )
 
 
 # === Batch Statistics tab ===
@@ -3310,7 +3540,7 @@ def render_help_tab() -> None:
 
     st.markdown("## Quick Start")
     st.markdown(
-        "1. **Upload a TIFF** in the sidebar of the Single Image tab."
+        "1. **Upload a TIFF** in the sidebar of the Single Image section."
         "\n"
         "2. **Check the metadata** — pixel size should be auto-detected from the "
         "OlympusSIS tag. If not, enter it manually under *Image Metadata → Override pixel size*."
@@ -3331,7 +3561,7 @@ def render_help_tab() -> None:
         "parameters + layer polygon + labeled image as base64 PNG)."
         "\n"
         "6. **For batch statistics** — repeat for each image, then go to the "
-        "**Batch Statistics** tab, drop all JSON reports in."
+        "**Batch Statistics** section, drop all JSON reports in."
     )
 
     st.markdown("---")
@@ -3373,25 +3603,38 @@ def render_help_tab() -> None:
     st.markdown(
         "The user clicks on each grain in the cropped layer image. For each "
         "click:"
-        "\n1. **Local FFT** is computed in a window (default 96×96 px, "
+        "\n1. **Local FFT** is computed in a window (default 128×128 px, "
         "configurable) around the click — zero-padded to 256×256 for better "
-        "frequency resolution."
+        "frequency resolution. The Hann window is applied BEFORE padding, so "
+        "the bright crosshair you may have seen in older versions (an "
+        "artifact of the padded content-square edges) is gone; any remaining "
+        "weak lines are real straight edges inside the window (grain "
+        "boundaries, layer interfaces)."
         "\n2. **d-spacings of the clicked grain** are found via the 1D radial "
         "profile detector + Gaussian quality filter (same as the global FFT "
         "method, but local). Each grain can have up to N plane families "
         "(default 5)."
-        "\n3. **Amplitude maps** are computed for each d-spacing — using the "
-        "GLOBAL FFT for better SNR (the global FFT is computed once and cached)."
+        "\n3. **Amplitude maps** are computed for each (d, θ) pair — by "
+        "default with the SLIDING local FFT (per-pixel selectivity by d AND "
+        "orientation); optionally via the global FFT with orientation-specific "
+        "disk masks."
         "\n4. **Region growing with hysteresis + AND-condition.** A pixel "
         "belongs to the grain if its min-amplitude (across all d-spacings) "
         "exceeds the growth threshold AND it is connected to the seed (click "
         "point). Hysteresis: the seed must pass a higher threshold than the "
         "growth — this prevents fragmented regions."
-        "\n5. **Auto-find similar grains.** After each click, the app scans "
+        "\n5. **Structure tensor cleanup (optional).** After region growing, "
+        "every pixel of the grain mask is judged with the structure tensor: "
+        "amorphous/textureless regions (coherence below threshold) and "
+        "textured regions whose fringe direction does not match the grain's "
+        "reflections are removed. Hysteresis protects small specks; if the "
+        "cleanup would remove most of the grain, the original mask is kept "
+        "with a warning."
+        "\n6. **Auto-find similar grains.** After each click, the app scans "
         "the rest of the layer for OTHER connected regions with the same "
         "d-spacing signature. The user can review and add them one-by-one or "
         "all at once."
-        "\n6. **Undo / Clear / Finish.** After all grains are marked, click "
+        "\n7. **Undo / Clear / Finish.** After all grains are marked, click "
         "Finish to compute the standard grain-size statistics (area, equivalent "
         "diameter, circularity, lognormal fit)."
         "\n"
@@ -3515,15 +3758,17 @@ def render_help_tab() -> None:
         "\n* **Vanilla SAM** (`sam_vit_b`, `sam_vit_l`) — Meta's original model, "
         "trained on natural images (SA-1B dataset). Works but is not specialised "
         "for microscopy."
-        "\n* **Micro-SAM** (`microsam_vit_b_em`, `microsam_vit_l_em`, "
-        "`microsam_vit_b_lm`, `microsam_vit_l_lm`) — fine-tuned variants from EMBL, "
-        "trained on microscopy data. **For TEM cross-sections, the EM-organelles "
-        "variants (`_em`) are recommended** — they were fine-tuned on electron "
-        "microscopy and understand TEM textures better than vanilla SAM."
+        "\n* **Micro-SAM** (`microsam_vit_b_lm`, `microsam_vit_l_lm`, "
+        "`microsam_vit_b_em`, `microsam_vit_l_em`) — fine-tuned variants from EMBL, "
+        "trained on microscopy data. **The LM variants are the default** "
+        "(`microsam_vit_b_lm` selected out of the box) — they were fine-tuned on "
+        "diverse microscopy data and handle TEM layer boundaries better than "
+        "vanilla SAM. The EM-organelles variants (`_em`) are an alternative "
+        "tuned specifically for electron-microscopy organelles."
         "\n\n"
         "**How to use:**"
         "\n1. Select **SAM (click on layer)** mode."
-        "\n2. (Optional) In *SAM parameters*, choose a Micro-SAM model for better TEM results."
+        "\n2. (Optional) In *SAM parameters*, choose a different Micro-SAM model."
         "\n3. Click on the layer in the image preview."
         "\n4. Wait for SAM (first click loads the model ~350 MB + encodes the image ~5 s; "
         "subsequent clicks on the same image are instant)."
@@ -3687,7 +3932,7 @@ def render_help_tab() -> None:
         "\n* **Polygon mode** — manual vertex entry via numeric inputs (no click-on-image). "
         "A future version may integrate `streamlit-drawable-canvas` for click-drawing."
         "\n* **One layer per analysis** — for multi-layer structures, run the "
-        "Single Image tab multiple times with different layers."
+        "Single Image section multiple times with different layers."
     )
 
     st.markdown("---")
@@ -3717,15 +3962,12 @@ def render_help_tab() -> None:
     )
 
 
-# === Render tabs ===
+# === Render the active section ===
 
-tab_single, tab_batch, tab_help = st.tabs(["Single Image", "Batch Statistics", "Help"])
-
-with tab_single:
+nav_tab = _render_navigation()
+if nav_tab == "Single Image":
     render_single_image_tab()
-
-with tab_batch:
+elif nav_tab == "Batch Statistics":
     render_batch_tab()
-
-with tab_help:
+else:
     render_help_tab()

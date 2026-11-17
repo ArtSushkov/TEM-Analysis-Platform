@@ -180,6 +180,29 @@ class ClickSegmentationParams:
     # Smooth grain boundaries with morphological open/close (kernel size, 0 = off).
     boundary_smooth_kernel: int = 3
 
+    # --- Structure tensor cleanup (optional post-filter) ---
+    # After region growing, judge every pixel of the grain mask with the
+    # structure tensor and remove amorphous / wrongly-oriented regions:
+    # (1) coherence gate — isotropic or textureless pixels (amorphous,
+    #     vacuum) are removed;
+    # (2) orientation gate — textured pixels whose fringe direction does not
+    #     match ANY of the grain's reflections (within tolerance) are removed;
+    # (3) hysteresis — only connected candidate regions larger than
+    #     cleanup_min_remove_area_px are actually removed, so fringe gaps and
+    #     single noisy pixels survive.
+    use_structure_cleanup: bool = False
+    # Structure tensor window (px). ~1.5× the lattice-fringe period; 3.0 is
+    # a good default for typical TEM d-spacings (2–8 px fringes).
+    cleanup_sigma_px: float = 3.0
+    # Anisotropy below this = amorphous/textureless → removal candidate.
+    cleanup_coherence_threshold: float = 0.35
+    # ± tolerance (degrees) for matching the local fringe direction against
+    # the selected reflections' FFT angles (mod 180°). 25° is forgiving
+    # enough for mosaic spread; 0 disables the orientation gate.
+    cleanup_orientation_tolerance_deg: float = 25.0
+    # Smallest connected candidate region (px) that is actually removed.
+    cleanup_min_remove_area_px: int = 25
+
     def to_dict(self) -> dict:
         """Serialize to a dict (for JSON report)."""
         from dataclasses import asdict
@@ -276,6 +299,8 @@ class GrainClickResult:
     # d_nm, r_global, reflections (list of dicts with expected_pos, actual_pos,
     # shift_px, peak_intensity, background_intensity, snr), best_snr, used_disk.
     amplitude_diag: list = field(default_factory=list)
+    # Structure tensor cleanup diagnostics (None = cleanup disabled/unused).
+    cleanup_diag: dict | None = None
 
 
 # === Core functions ===
@@ -329,17 +354,23 @@ def compute_local_fft(
     if window.dtype != np.uint8:
         window = np.clip(window, 0, 255).astype(np.uint8)
 
-    # Optional zero-padding (improves frequency resolution).
-    if zero_pad_size > max(window.shape):
-        padded = np.zeros((zero_pad_size, zero_pad_size), dtype=np.uint8)
-        # Center the window in the padded array.
-        pr0 = (zero_pad_size - window.shape[0]) // 2
-        pc0 = (zero_pad_size - window.shape[1]) // 2
-        padded[pr0:pr0 + window.shape[0], pc0:pc0 + window.shape[1]] = window
-        window = padded
-
-    # Preprocess (CLAHE + Hann) and FFT.
+    # Preprocess (CLAHE + Hann) FIRST — on the real window, BEFORE any
+    # zero-padding. If padding were applied first, the sharp edges of the
+    # content square sitting inside the black canvas act as two perpendicular
+    # straight edges and produce a bright cross ("crosshair") through the FFT
+    # center; the Hann window would NOT suppress it, because it only tapers
+    # the outer boundary of the padded array, not the content square inside.
     img = _preprocess(window, params)
+
+    # Optional zero-padding (improves frequency resolution).
+    if zero_pad_size > max(img.shape):
+        padded = np.zeros((zero_pad_size, zero_pad_size), dtype=img.dtype)
+        # Center the window in the padded array.
+        pr0 = (zero_pad_size - img.shape[0]) // 2
+        pc0 = (zero_pad_size - img.shape[1]) // 2
+        padded[pr0:pr0 + img.shape[0], pc0:pc0 + img.shape[1]] = img
+        img = padded
+
     fft_shifted, log_power = _compute_power_spectrum(img)
     if params.use_wiener_filter:
         fft_shifted, log_power = _apply_wiener_filter(fft_shifted, params)
@@ -530,15 +561,19 @@ def compute_sliding_local_ffts(
             win_mask = cropped_mask[r0:r1, c0:c1]
             if win_mask.sum() < 0.25 * win_mask.size:
                 continue
-            # Zero-pad.
-            if zero_pad_size > max(window.shape):
-                padded = np.zeros((zero_pad_size, zero_pad_size), dtype=np.uint8)
-                pr0 = (zero_pad_size - window.shape[0]) // 2
-                pc0 = (zero_pad_size - window.shape[1]) // 2
-                padded[pr0:pr0 + window.shape[0], pc0:pc0 + window.shape[1]] = window
-                window = padded
-            # Preprocess + FFT + Wiener.
+            # Preprocess (CLAHE + Hann) BEFORE zero-padding — same reason as
+            # in compute_local_fft: padding first would make the content
+            # square edges act as straight edges and paint a crosshair
+            # through the FFT center.
             img = _preprocess(window, fft_params)
+            # Zero-pad.
+            if zero_pad_size > max(img.shape):
+                padded = np.zeros((zero_pad_size, zero_pad_size), dtype=img.dtype)
+                pr0 = (zero_pad_size - img.shape[0]) // 2
+                pc0 = (zero_pad_size - img.shape[1]) // 2
+                padded[pr0:pr0 + img.shape[0], pc0:pc0 + img.shape[1]] = img
+                img = padded
+            # FFT + Wiener.
             fft_shifted, log_power = _compute_power_spectrum(img)
             if fft_params.use_wiener_filter:
                 fft_shifted, log_power = _apply_wiener_filter(fft_shifted, fft_params)
@@ -917,6 +952,59 @@ def build_amplitude_map_from_manual_reflection(
     return amp, diag
 
 
+def _apply_structure_cleanup(
+    cropped_img: np.ndarray,
+    grain_mask: np.ndarray,
+    click_params: ClickSegmentationParams,
+    orientation_targets_deg: list | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Optional post-filter: remove amorphous / wrongly-oriented pixels from
+    a grown grain mask using the structure tensor.
+
+    The FFT angles (0–180°, mod 180) of the grain's reflections are used
+    directly as orientation targets: the structure tensor's dominant GRADIENT
+    direction of a fringe pattern equals the scattering-vector direction of
+    the corresponding reflection (both are normal to the fringes).
+    """
+    if not click_params.use_structure_cleanup or not grain_mask.any():
+        return grain_mask, None
+    try:
+        from .structure_tensor_segmentation import (
+            cleanup_grain_mask_with_structure_tensor,
+        )
+    except Exception:
+        # skimage missing etc. — cleanup is optional, never break segmentation.
+        return grain_mask, None
+    cleaned, diag = cleanup_grain_mask_with_structure_tensor(
+        cropped_img, grain_mask,
+        sigma=click_params.cleanup_sigma_px,
+        coherence_threshold=click_params.cleanup_coherence_threshold,
+        orientation_targets_deg=list(orientation_targets_deg or []),
+        orientation_tolerance_deg=click_params.cleanup_orientation_tolerance_deg,
+        min_remove_area_px=click_params.cleanup_min_remove_area_px,
+    )
+    return cleaned, diag
+
+
+def _cleanup_similar_masks(
+    cropped_img: np.ndarray,
+    similar_masks: list,
+    click_params: ClickSegmentationParams,
+    orientation_targets_deg: list | None = None,
+) -> list:
+    """Apply the structure tensor cleanup to auto-found similar-grain masks."""
+    if not click_params.use_structure_cleanup or not similar_masks:
+        return similar_masks
+    cleaned = []
+    for sm in similar_masks:
+        sm_c, _ = _apply_structure_cleanup(
+            cropped_img, sm, click_params, orientation_targets_deg,
+        )
+        if sm_c.any():
+            cleaned.append(sm_c)
+    return cleaned
+
+
 def segment_grain_from_click_with_reflections(
     cropped_img: np.ndarray,
     cropped_mask: np.ndarray,
@@ -1055,6 +1143,16 @@ def segment_grain_from_click_with_reflections(
             grow_diag["fallback_used"] = ("single-d fallback: used only the "
                                           "strongest reflection.")
 
+    # 3.5 Structure tensor cleanup (optional post-filter): remove amorphous /
+    # wrongly-oriented regions from the grown mask using the selected
+    # reflections' FFT angles as orientation targets.
+    cleanup_diag = None
+    if click_params.use_structure_cleanup and grain_mask.sum() > 0:
+        grain_mask, cleanup_diag = _apply_structure_cleanup(
+            cropped_img, grain_mask, click_params, orientations_deg,
+        )
+        grown_area = int(grain_mask.sum())
+
     if grain_mask.sum() == 0:
         amp_strs = [f"d={d:.3f}nm θ={theta:.1f}° amp={a:.3f}"
                     for d, theta, a in zip(d_spacings_nm, orientations_deg, seed_amplitudes)]
@@ -1090,6 +1188,9 @@ def segment_grain_from_click_with_reflections(
         similar = find_similar_grains(
             amplitude_maps, grain_mask, cropped_mask, click_params,
         )
+        similar = _cleanup_similar_masks(
+            cropped_img, similar, click_params, orientations_deg,
+        )
 
     signature = GrainSignature(
         d_spacings_nm=d_spacings_nm, radii_px=radii_global, qualities=qualities,
@@ -1104,6 +1205,12 @@ def segment_grain_from_click_with_reflections(
         msg += f" Found {n_similar} similar grain(s)."
     if grow_diag.get("fallback_used"):
         msg += f" Note: {grow_diag['fallback_used']}"
+    if cleanup_diag and cleanup_diag.get("removed_px"):
+        msg += (f" Structure-tensor cleanup removed {cleanup_diag['removed_px']} px "
+                f"({cleanup_diag['removed_frac'] * 100:.0f}%) as amorphous/"
+                f"wrong-orientation.")
+    elif cleanup_diag and cleanup_diag.get("note"):
+        msg += f" Cleanup note: {cleanup_diag['note']}"
 
     return GrainClickResult(
         grain_mask=grain_mask,
@@ -1124,6 +1231,7 @@ def segment_grain_from_click_with_reflections(
         safety_thresholds_tried=list(grow_diag.get("safety_thresholds_tried", [])),
         fallback_used=str(grow_diag.get("fallback_used", "")),
         amplitude_diag=amplitude_diag,
+        cleanup_diag=cleanup_diag,
     )
 
 
@@ -1663,6 +1771,17 @@ def segment_grain_from_click(
                                               + ", d=" + f"{single_d[0]:.3f}" + " nm). "
                                               + grow_diag.get("fallback_used", ""))
 
+    # 4.5 Structure tensor cleanup (optional post-filter): remove amorphous /
+    # wrongly-oriented regions from the grown mask. Orientation targets are
+    # the grain's detected reflection angles (sliding mode); in legacy mode
+    # they may be empty → coherence-only gate.
+    cleanup_diag = None
+    if click_params.use_structure_cleanup and grain_mask.sum() > 0:
+        grain_mask, cleanup_diag = _apply_structure_cleanup(
+            cropped_img, grain_mask, click_params, orientations_deg,
+        )
+        grown_area = int(grain_mask.sum())
+
     if grain_mask.sum() == 0:
         # Build a detailed diagnostic message.
         amp_strs = [f"d={d:.3f}nm amp={a:.3f}" for d, a in zip(d_spacings, seed_amplitudes)]
@@ -1710,6 +1829,9 @@ def segment_grain_from_click(
         similar = find_similar_grains(
             amplitude_maps, grain_mask, cropped_mask, click_params,
         )
+        similar = _cleanup_similar_masks(
+            cropped_img, similar, click_params, orientations_deg,
+        )
 
     signature = GrainSignature(
         d_spacings_nm=d_spacings, radii_px=radii_global, qualities=qualities,
@@ -1724,6 +1846,12 @@ def segment_grain_from_click(
         msg += f" Found {n_similar} similar grain(s) — review below."
     if grow_diag.get("fallback_used"):
         msg += f" Note: {grow_diag['fallback_used']}"
+    if cleanup_diag and cleanup_diag.get("removed_px"):
+        msg += (f" Structure-tensor cleanup removed {cleanup_diag['removed_px']} px "
+                f"({cleanup_diag['removed_frac'] * 100:.0f}%) as amorphous/"
+                f"wrong-orientation.")
+    elif cleanup_diag and cleanup_diag.get("note"):
+        msg += f" Cleanup note: {cleanup_diag['note']}"
 
     return GrainClickResult(
         grain_mask=grain_mask,
@@ -1744,4 +1872,5 @@ def segment_grain_from_click(
         safety_thresholds_tried=list(grow_diag.get("safety_thresholds_tried", [])),
         fallback_used=str(grow_diag.get("fallback_used", "")),
         amplitude_diag=amplitude_diag,
+        cleanup_diag=cleanup_diag,
     )
