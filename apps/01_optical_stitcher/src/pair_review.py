@@ -18,6 +18,12 @@ Functions:
     are reported in FULL-RESOLUTION pixels)
 - render_pair_preview(): alignment overlay renderings
     ("blend" 50/50, "checker" board, "difference" map) with tile outlines
+- render_pair_preview_static(): two tiles side by side with a marker on
+    the expected seam — a static reference for the eye, so alignment
+    errors are not hidden behind an overlay.
+- render_tile_with_roi_overlay(): full tile + the auto-detected ROI band
+    drawn on top, so the user can see whether the band caught the disk
+    or needs a manual offset correction.
 - no_overlap_position() / apply_no_overlap_flag(): "No overlap" pair logic
     (place tiles side by side with a black gap)
 - to_json() / apply_json(): save / restore a review session (positions,
@@ -254,6 +260,196 @@ def _put_label(img: np.ndarray, org: Tuple[int, int], text: str,
                 (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.1,
                 color, 2, cv2.LINE_AA)
+
+
+# --------------------------------------------------------------------------
+# Static side-by-side preview (alignment inspector — no overlay)
+# --------------------------------------------------------------------------
+
+def render_pair_preview_static(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    dx: float,
+    dy: float,
+    out_width: int = 480,
+    separator: int = 6,
+) -> np.ndarray:
+    """Render two tiles SIDE BY SIDE as a static alignment reference.
+
+    Unlike `render_pair_preview` (which OVERLAYS the tiles), this keeps
+    each tile intact in its own column. The expected seam is shown as a
+    pair of horizontal marker lines (in tile A: where tile B's left edge
+    will land; in tile B: where tile A's right edge ends), so the user
+    can visually compare common features across the seam without one
+    tile hiding the other. A misaligned overlay can look "fine" because
+    both tiles average out; the side-by-side view makes a wrong dx/dy
+    immediately visible.
+
+    dx, dy: shift of tile B relative to tile A, in the SAME pixel units
+        as the input images (review-scale px; positive dx = B to the
+        right, positive dy = B down). The markers on each tile use the
+        full tile width / height, so dx that exceeds the tile width
+        (no-overlap case) is drawn as a marker outside the visible
+        overlap region.
+
+    Returns an RGB uint8 image with width <= out_width.
+    """
+    ia, ib = int(round(dx)), int(round(dy))
+    h_a, w_a = img_a.shape[:2]
+    h_b, w_b = img_b.shape[:2]
+    out_h = max(h_a, h_b)
+    canvas = np.zeros((out_h, w_a + separator + w_b, 3), np.uint8)
+    canvas[:h_a, :w_a] = img_a
+    canvas[:h_b, w_a + separator:] = img_b
+
+    # Marker on tile A: vertical line at x = ia (where B's left edge lands).
+    # If ia is within [0, w_a) — B overlaps A starting here.
+    # If ia is within [w_a, w_a + separator + w_b) — B is in the separator
+    # or in its own zone (no overlap with A).
+    if 0 <= ia <= w_a:
+        cv2.line(canvas, (ia, 0), (ia, h_a), (0, 255, 255), 1)  # yellow
+        _put_label(canvas, (ia + 4, 30), "B starts", (0, 255, 255))
+    # Marker on tile B: vertical line at x = (ia - dx_marker) — no,
+    # we want to show on tile B where A's RIGHT edge ends (i.e. column
+    # (w_a - ia) of tile B corresponds to the seam). For dx reviews we
+    # draw a yellow line at b-local column = w_a - ia when that is in range.
+    b_seam_local = w_a - ia
+    if 0 <= b_seam_local <= w_b:
+        b_x = w_a + separator + b_seam_local
+        cv2.line(canvas, (b_x, 0), (b_x, h_b), (0, 255, 255), 1)
+        _put_label(canvas, (b_x + 4, 30), "A ends", (0, 255, 255))
+
+    # dy markers: short horizontal ticks at the left and right edges
+    # showing where the opposite tile's row 0 lands.
+    if 0 <= ib <= h_a:
+        cv2.line(canvas, (0, ib), (w_a, ib), (255, 255, 0), 1)  # cyan
+    b_dy_local = -ib   # row of tile A's bottom in tile B's local frame
+    if 0 <= b_dy_local <= h_b:
+        cv2.line(canvas,
+                 (w_a + separator, b_dy_local),
+                 (w_a + separator + w_b, b_dy_local),
+                 (255, 255, 0), 1)
+
+    # Tile outlines + labels
+    cv2.rectangle(canvas, (0, 0), (w_a - 1, h_a - 1), (0, 255, 255), 1)
+    cv2.rectangle(canvas, (w_a + separator, 0),
+                  (w_a + separator + w_b - 1, h_b - 1), (255, 255, 0), 1)
+    _put_label(canvas, (8, 40), "A", (0, 255, 255))
+    _put_label(canvas, (w_a + separator + 8, 40), "B", (255, 255, 0))
+
+    if out_width and canvas.shape[1] > out_width:
+        s = out_width / canvas.shape[1]
+        canvas = cv2.resize(canvas,
+                            (out_width,
+                             max(1, int(round(canvas.shape[0] * s)))),
+                            interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+
+# --------------------------------------------------------------------------
+# ROI overlay on a single tile (auto-detect visualization)
+# --------------------------------------------------------------------------
+
+def render_tile_with_roi_overlay(
+    img: np.ndarray,
+    roi_band: Tuple[int, int],
+    out_width: int = 320,
+    alpha: float = 0.35,
+) -> np.ndarray:
+    """Draw the auto-detected (or manually corrected) ROI band on top of
+    a FULL tile, so the user can see whether the band actually brackets
+    the disk cross-section or needs a manual offset correction.
+
+    The whole frame is shown dimmed (multiplied by (1 - alpha)); the ROI
+    band keeps full brightness and is outlined with a yellow rectangle.
+    A label "ROI y=[y0,y1)" is drawn in the top-left corner.
+
+    Returns an RGB uint8 image with width <= out_width.
+    """
+    y0, y1 = roi_band
+    h, w = img.shape[:2]
+    out = img.astype(np.float32)
+    # Dim the outside
+    mask = np.ones((h, w), dtype=np.float32) * (1.0 - alpha)
+    mask[y0:y1, :] = 1.0
+    if img.ndim == 3:
+        mask_b = mask[:, :, None]
+    else:
+        mask_b = mask
+    out = (out * mask_b).clip(0, 255).astype(np.uint8)
+
+    # Outline the ROI band
+    cv2.rectangle(out, (0, y0), (w - 1, max(y0 + 1, y1 - 1)),
+                  (0, 255, 255), 1)
+    _put_label(out, (8, max(0, y0 - 8)), f"ROI y=[{y0},{y1})",
+               (0, 255, 255))
+    if out_width and w > out_width:
+        s = out_width / w
+        out = cv2.resize(out, (out_width, max(1, int(round(h * s)))),
+                         interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+
+
+def render_tile_with_two_roi_overlays(
+    img: np.ndarray,
+    band_applied: Tuple[int, int],
+    band_own: Tuple[int, int],
+    out_width: int = 320,
+    alpha: float = 0.35,
+) -> np.ndarray:
+    """Show a FULL tile with TWO ROI bands drawn for comparison:
+
+    - ``band_applied`` — the band that WILL be applied to every tile
+      (the tile-1 band in the reference-tile workflow): the frame is
+      dimmed outside it and it is outlined in YELLOW with an
+      "APPLIED y=[y0,y1)" label.
+    - ``band_own`` — this tile's OWN auto-detected band, outlined in
+      GREEN with an "OWN y=[y0,y1)" label.
+
+    Drawing both on ONE frame lets the user judge how the tile-1 band
+    lands relative to the disk cross-section on each individual tile
+    (stacking two tile previews could hide a mismatch).
+
+    Returns an RGB uint8 image with width <= out_width.
+    """
+    h, w = img.shape[:2]
+
+    def _clamp(band):
+        y0 = max(0, min(h - 1, int(band[0])))
+        y1 = max(y0 + 1, min(h, int(band[1])))
+        return y0, y1
+
+    y0a, y1a = _clamp(band_applied)
+    y0o, y1o = _clamp(band_own)
+
+    out = img.astype(np.float32)
+    # Dim everything outside the APPLIED band (that is what will be cropped)
+    mask = np.ones((h, w), dtype=np.float32) * (1.0 - alpha)
+    mask[y0a:y1a, :] = 1.0
+    if img.ndim == 3:
+        mask_b = mask[:, :, None]
+    else:
+        mask_b = mask
+    out = (out * mask_b).clip(0, 255).astype(np.uint8)
+
+    # Own band: green outline; applied band: yellow outline
+    cv2.rectangle(out, (0, y0o), (w - 1, max(y0o + 1, y1o - 1)),
+                  (0, 255, 0), 1)
+    cv2.rectangle(out, (0, y0a), (w - 1, max(y0a + 1, y1a - 1)),
+                  (0, 255, 255), 1)
+    _put_label(out, (8, max(12, y0a - 8)),
+               f"APPLIED y=[{y0a},{y1a})", (0, 255, 255))
+    # Keep the OWN label readable when the two bands (and labels) are close
+    if abs(y0a - y0o) < 30:
+        ly = min(h - 12, y1o + 14)
+    else:
+        ly = max(12, y0o - 8)
+    _put_label(out, (8, ly), f"OWN y=[{y0o},{y1o})", (0, 255, 0))
+    if out_width and w > out_width:
+        s = out_width / w
+        out = cv2.resize(out, (out_width, max(1, int(round(h * s)))),
+                         interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
 
 # --------------------------------------------------------------------------

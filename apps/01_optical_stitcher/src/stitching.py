@@ -38,12 +38,71 @@ All NCC strip comparisons therefore use overlap strips of width
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from . import preprocessing
+
+
+# --------------------------------------------------------------------------
+# Per-tile feature cache (optimization №1)
+# --------------------------------------------------------------------------
+#
+# Each tile (except the row endpoints) is processed twice: as the RIGHT
+# tile of pair (i-1, i) and as the LEFT tile of pair (i, i+1). Without a
+# cache, CLAHE and SIFT detectAndCompute run twice per interior tile.
+# SIFT detection is typically the slowest single step (100-500 ms per
+# 2736x1824 tile at 5000 features), so caching it cuts the pairwise-
+# estimation stage roughly in half.
+#
+# The cache is keyed by id(img) — fast, and stable across calls because
+# the pipeline holds the SAME ndarray object for a given tile throughout
+# the row. Caller must pass a fresh cache for each row (or when CLAHE /
+# n_features params change).
+
+# Cache entry: (clahe_bgr, clahe_gray, sift_kp, sift_desc)
+TileCacheEntry = Tuple[np.ndarray, np.ndarray, list, np.ndarray]
+
+
+def _get_tile_features(
+    img: np.ndarray,
+    use_clahe: bool,
+    clahe_clip: float,
+    n_features: int,
+    tile_cache: Optional[Dict[int, TileCacheEntry]] = None,
+) -> Tuple[np.ndarray, np.ndarray, list, np.ndarray]:
+    """CLAHE BGR, CLAHE grayscale, SIFT keypoints & descriptors for a tile.
+
+    Cached by id(img) when `tile_cache` is provided. Returns:
+      (clahe_bgr, clahe_gray, keypoints, descriptors)
+
+    clahe_bgr:  uint8 BGR (or the original img if use_clahe=False)
+    clahe_gray: uint8 grayscale of clahe_bgr
+    keypoints:  list of cv2.KeyPoint
+    descriptors: np.ndarray of SIFT descriptors (or None)
+    """
+    if tile_cache is None:
+        # Bypass cache: compute fresh (used by standalone callers/tests)
+        clahe_bgr = (preprocessing.apply_clahe(img, clip_limit=clahe_clip)
+                     if use_clahe else img)
+        clahe_gray = preprocessing.to_gray(clahe_bgr)
+        sift = cv2.SIFT_create(nfeatures=n_features)
+        kp, desc = sift.detectAndCompute(clahe_gray, None)
+        return clahe_bgr, clahe_gray, kp, desc
+
+    key = id(img)
+    entry = tile_cache.get(key)
+    if entry is None:
+        clahe_bgr = (preprocessing.apply_clahe(img, clip_limit=clahe_clip)
+                     if use_clahe else img)
+        clahe_gray = preprocessing.to_gray(clahe_bgr)
+        sift = cv2.SIFT_create(nfeatures=n_features)
+        kp, desc = sift.detectAndCompute(clahe_gray, None)
+        entry = (clahe_bgr, clahe_gray, kp, desc)
+        tile_cache[key] = entry
+    return entry
 
 
 @dataclass
@@ -77,8 +136,23 @@ def _prepare_gray(
     img_b: np.ndarray,
     use_clahe: bool = True,
     clahe_clip: float = 3.0,
+    tile_cache: Optional[Dict[int, TileCacheEntry]] = None,
+    n_features: int = 2000,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """CLAHE + grayscale conversion for both images (float32)."""
+    """CLAHE + grayscale conversion for both images (float32).
+
+    When `tile_cache` is given, the CLAHE grayscale is read from the cache
+    (computed once per tile, reused across both pair occurrences of an
+    interior tile). The cache also stores SIFT keypoints/descriptors so
+    the SIFT stage does not have to recompute them either.
+    """
+    if tile_cache is not None:
+        _, ga_u8, _, _ = _get_tile_features(
+            img_a, use_clahe, clahe_clip, n_features, tile_cache)
+        _, gb_u8, _, _ = _get_tile_features(
+            img_b, use_clahe, clahe_clip, n_features, tile_cache)
+        return ga_u8.astype(np.float32), gb_u8.astype(np.float32)
+
     if use_clahe:
         a_proc = preprocessing.apply_clahe(img_a, clip_limit=clahe_clip)
         b_proc = preprocessing.apply_clahe(img_b, clip_limit=clahe_clip)
@@ -523,7 +597,7 @@ def _filter_fixed_pattern_matches(
 def stitch_pair_sift(
     img_a: np.ndarray,
     img_b: np.ndarray,
-    n_features: int = 5000,
+    n_features: int = 2000,
     ratio_thresh: float = 0.75,
     ransac_thresh: float = 5.0,
     use_clahe: bool = True,
@@ -531,6 +605,7 @@ def stitch_pair_sift(
     suppress_fixed_pattern: bool = True,
     prior_translation: Optional[Tuple[float, float]] = None,
     prior_window: float = 60.0,
+    tile_cache: Optional[Dict[int, TileCacheEntry]] = None,
 ) -> PairResult:
     """Stitch a pair via SIFT + RANSAC.
 
@@ -544,19 +619,18 @@ def stitch_pair_sift(
         translation is within `prior_window` px of the prior are used for
         RANSAC. This rescues SIFT on samples where ambiguous features
         (scratches, dots) otherwise produce a wrong consensus.
+    tile_cache: optional per-tile cache of CLAHE images + SIFT keypoints
+        and descriptors. Keyed by id(img); the pipeline populates it as
+        tiles are seen, so an interior tile (processed as right of pair
+        i-1 and left of pair i) is only CLAHE'd and SIFT'd ONCE.
     """
-    if use_clahe:
-        a_proc = preprocessing.apply_clahe(img_a, clip_limit=clahe_clip)
-        b_proc = preprocessing.apply_clahe(img_b, clip_limit=clahe_clip)
-    else:
-        a_proc, b_proc = img_a, img_b
-
-    ga = preprocessing.to_gray(a_proc)
-    gb = preprocessing.to_gray(b_proc)
-
-    sift = cv2.SIFT_create(nfeatures=n_features)
-    ka, da = sift.detectAndCompute(ga, None)
-    kb, db = sift.detectAndCompute(gb, None)
+    # CLAHE + SIFT with per-tile caching. The grayscale used for SIFT
+    # detection must be uint8 (cv2.SIFT expects uint8), so we read the
+    # clahe_gray from the cache (uint8) directly.
+    clahe_bgr_a, ga, ka, da = _get_tile_features(
+        img_a, use_clahe, clahe_clip, n_features, tile_cache)
+    clahe_bgr_b, gb, kb, db = _get_tile_features(
+        img_b, use_clahe, clahe_clip, n_features, tile_cache)
 
     if da is None or db is None or len(ka) < 4 or len(kb) < 4:
         return PairResult(
@@ -651,6 +725,9 @@ def stitch_pair_phase(
     img_b: np.ndarray,
     use_clahe: bool = True,
     gray: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    tile_cache: Optional[Dict[int, TileCacheEntry]] = None,
+    n_features: int = 2000,
+    clahe_clip: float = 3.0,
 ) -> PairResult:
     """Fallback: phase correlation for pure translation.
 
@@ -659,8 +736,13 @@ def stitch_pair_phase(
     """
     if gray is not None:
         ga, gb = gray
+    elif tile_cache is not None:
+        ga, gb = _prepare_gray(img_a, img_b, use_clahe=use_clahe,
+                               clahe_clip=clahe_clip, tile_cache=tile_cache,
+                               n_features=n_features)
     else:
-        ga, gb = _prepare_gray(img_a, img_b, use_clahe=use_clahe)
+        ga, gb = _prepare_gray(img_a, img_b, use_clahe=use_clahe,
+                               clahe_clip=clahe_clip)
 
     (shift_x, shift_y), response = cv2.phaseCorrelate(ga, gb)
     # phaseCorrelate returns the shift to apply to b to get a.
@@ -746,6 +828,9 @@ def stitch_pair_ncc(
     gray: Optional[Tuple[np.ndarray, np.ndarray]] = None,
     row_prior_dx: Optional[float] = None,
     expected_dx: Optional[float] = None,
+    ncc_prior_window: int = 250,
+    tile_cache: Optional[Dict[int, TileCacheEntry]] = None,
+    n_features: int = 2000,
 ) -> PairResult:
     """Robust fallback: brute-force shift scan using NCC.
 
@@ -776,10 +861,25 @@ def stitch_pair_ncc(
     row_prior_dx: median dx of the pairs already solved in this row (robust
         prior for the expected overlap of the current pair).
     expected_dx: dx implied by the user's expected capture overlap.
+    ncc_prior_window: when `row_prior_dx` is provided, the Stage 1 coarse
+        scan and the Stage 2b global dx re-scan are narrowed to
+        `[row_prior_dx - ncc_prior_window, row_prior_dx + ncc_prior_window]`
+        instead of the full `(dx_range[0], dx_range[1])`. The optimum is
+        in this window with very high probability when the row is
+        consistent (which is the only situation in which `row_prior_dx`
+        is set — the pipeline requires >= 2 previously solved pairs).
+        Default 250 px is wide enough to absorb genuine pair-to-pair
+        overlap variation in a microscope row, while cutting Stage 2b
+        iterations ~10x. Quality-neutral: the global scan still runs at
+        the full range for the first 1-2 pairs (no prior yet).
     """
     del step  # legacy parameter, unused
     if gray is not None:
         ga, gb = gray
+    elif tile_cache is not None:
+        ga, gb = _prepare_gray(img_a, img_b, use_clahe=use_clahe,
+                               clahe_clip=clahe_clip, tile_cache=tile_cache,
+                               n_features=n_features)
     else:
         ga, gb = _prepare_gray(img_a, img_b, use_clahe=use_clahe,
                                clahe_clip=clahe_clip)
@@ -787,6 +887,22 @@ def stitch_pair_ncc(
 
     # Fixed evaluation window for dx-comparable full-resolution scoring.
     eval_win = max(250, min(400, w // 5))
+
+    # Optimization №2: narrow the dx scan range when a reliable row prior
+    # exists. The pipeline only passes row_prior_dx after >= 2 solved
+    # pairs, so by the time it is set the row's consistency is established
+    # and the optimum is within ±ncc_prior_window px with very high
+    # probability. Falls back to the full range when no prior is available
+    # (the first 1-2 pairs of a row).
+    if row_prior_dx is not None:
+        prior_lo = max(int(dx_range[0]), int(row_prior_dx - ncc_prior_window))
+        prior_hi = min(int(dx_range[1]), int(row_prior_dx + ncc_prior_window))
+        if prior_hi - prior_lo >= 100:  # sanity: window is meaningful
+            dx_range_eff = (prior_lo, prior_hi)
+        else:
+            dx_range_eff = dx_range
+    else:
+        dx_range_eff = dx_range
 
     # Stage 1: global coarse scan on a downscaled copy
     scale = min(1.0, 600.0 / max(h, w))
@@ -796,8 +912,8 @@ def stitch_pair_ncc(
     else:
         gs_a, gs_b = ga, gb
 
-    dx_hi_cap = min(dx_range[1], w - eval_win - 10)
-    c_dx = (max(10, int(dx_range[0] * scale)), int(dx_hi_cap * scale))
+    dx_hi_cap = min(dx_range_eff[1], w - eval_win - 10)
+    c_dx = (max(10, int(dx_range_eff[0] * scale)), int(dx_hi_cap * scale))
     c_dy = (int(dy_range[0] * scale), int(dy_range[1] * scale))
     # ~8 px grid on the small image; peak localization error ~±4 small px
     # (~±14 full px) — well inside the ±30 px fine window below.
@@ -826,7 +942,7 @@ def stitch_pair_ncc(
     # a rows_step=2 coarse winner with the stage-2 score, or used the full
     # strip — whose score rises towards degenerate small overlaps once dy is
     # free per dx — and silently missed the hill top.)
-    dx_lo2 = max(50, dx_range[0])
+    dx_lo2 = max(50, dx_range_eff[0])
     dx_hi2 = min(dx_hi_cap, w - eval_win)
     if dx_hi2 - dx_lo2 > 2 * fine_window:
         best = (fine_score, int(round(fdx)), int(round(fdy)))
@@ -1015,10 +1131,20 @@ def stitch_pair_ncc(
     if profile_translation is None:
         if use_clahe:
             try:
-                a8 = preprocessing.to_gray(preprocessing.apply_clahe(
-                    img_a, clip_limit=clahe_clip)).astype(np.float32)
-                b8 = preprocessing.to_gray(preprocessing.apply_clahe(
-                    img_b, clip_limit=clahe_clip)).astype(np.float32)
+                # Use the per-tile cache so CLAHE for img_a / img_b is only
+                # computed ONCE per tile (not recomputed here for ECC).
+                # When tile_cache is None, _get_tile_features just computes
+                # fresh — same behaviour as the original code.
+                clahe_bgr_a, _, _, _ = _get_tile_features(
+                    img_a, use_clahe, clahe_clip,
+                    n_features if tile_cache is not None else 5000,
+                    tile_cache)
+                clahe_bgr_b, _, _, _ = _get_tile_features(
+                    img_b, use_clahe, clahe_clip,
+                    n_features if tile_cache is not None else 5000,
+                    tile_cache)
+                a8 = preprocessing.to_gray(clahe_bgr_a).astype(np.float32)
+                b8 = preprocessing.to_gray(clahe_bgr_b).astype(np.float32)
             except Exception:
                 a8, b8 = ga.astype(np.float32), gb.astype(np.float32)
         else:
@@ -1081,13 +1207,93 @@ def stitch_pair_ncc(
 
 
 # --------------------------------------------------------------------------
+# Full-resolution ECC polish (used by downscale-for-estimation)
+# --------------------------------------------------------------------------
+
+def polish_translation_full_res(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    dx: float,
+    dy: float,
+    use_clahe: bool = True,
+    clahe_clip: float = 3.0,
+    tile_cache: Optional[Dict[int, TileCacheEntry]] = None,
+    n_features: int = 2000,
+    max_correction: float = 30.0,
+    min_cc: float = 0.3,
+) -> Tuple[float, float, float, bool]:
+    """Refine a translation estimate to sub-pixel accuracy at FULL resolution.
+
+    Used by the downscale-for-estimation optimization: when the pairwise
+    estimate was computed on downscaled copies (e.g. max side 1600 px for
+    a 5472x3648 original), scaling the translation back up leaves a
+    quantization error of roughly 0.1-1 px at full resolution. One ECC
+    (findTransformECC) run on the overlap strip recovers true sub-pixel
+    accuracy at a cost of ~50-300 ms per pair — negligible compared to
+    the seconds saved by downscaled estimation.
+
+    dx, dy: translation estimate in FULL-RESOLUTION pixels
+        (shift of tile b relative to tile a).
+    max_correction: reject the polish when ECC moves the translation by
+        more than this many px (guard against ECC drift on repetitive
+        texture).
+    min_cc: minimum ECC correlation coefficient to accept the polish.
+
+    Returns (dx_polished, dy_polished, cc, converged).
+    When the polish is rejected or fails, the input (dx, dy) is returned
+    unchanged with converged=False.
+    """
+    ga, gb = _prepare_gray(img_a, img_b, use_clahe=use_clahe,
+                           clahe_clip=clahe_clip, tile_cache=tile_cache,
+                           n_features=n_features)
+    h, w = ga.shape
+    if use_clahe and tile_cache is not None:
+        try:
+            clahe_bgr_a, _, _, _ = _get_tile_features(
+                img_a, use_clahe, clahe_clip, n_features, tile_cache)
+            clahe_bgr_b, _, _, _ = _get_tile_features(
+                img_b, use_clahe, clahe_clip, n_features, tile_cache)
+            a8 = preprocessing.to_gray(clahe_bgr_a).astype(np.float32)
+            b8 = preprocessing.to_gray(clahe_bgr_b).astype(np.float32)
+        except Exception:
+            a8, b8 = ga.astype(np.float32), gb.astype(np.float32)
+    else:
+        a8, b8 = ga.astype(np.float32), gb.astype(np.float32)
+
+    ix0, iy0 = max(0, int(dx)), max(0, int(dy))
+    ix1, iy1 = min(w, int(dx) + w), min(h, int(dy) + h)
+    if ix1 - ix0 < 100 or iy1 - iy0 < 100:
+        return dx, dy, 0.0, False
+    tpl = a8[iy0:iy1, ix0:ix1]
+    inp = b8[iy0 - int(dy):iy1 - int(dy),
+             ix0 - int(dx):ix1 - int(dx)]
+    if not (tpl.size and inp.size and tpl.shape == inp.shape):
+        return dx, dy, 0.0, False
+    warp = np.eye(2, 3, dtype=np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
+    try:
+        cc, warp = cv2.findTransformECC(tpl, inp, warp,
+                                        cv2.MOTION_TRANSLATION,
+                                        crit, None, 5)
+        # warp maps input(b-crop) coords -> template(a-crop) coords
+        dx_e = dx - float(warp[0, 2])
+        dy_e = dy - float(warp[1, 2])
+        if cc > min_cc and abs(dx_e - dx) < max_correction \
+                and abs(dy_e - dy) < max_correction:
+            return float(dx_e), float(dy_e), float(cc), True
+    except cv2.error:
+        pass
+    return dx, dy, 0.0, False
+
+
+# --------------------------------------------------------------------------
 # Orchestrator with NCC verification
 # --------------------------------------------------------------------------
 
 def stitch_pair(
     img_a: np.ndarray,
     img_b: np.ndarray,
-    n_features: int = 5000,
+    n_features: int = 2000,
     ratio_thresh: float = 0.75,
     ransac_thresh: float = 5.0,
     use_clahe: bool = True,
@@ -1100,6 +1306,8 @@ def stitch_pair(
     suppress_fixed_pattern: bool = True,
     row_prior_dx: Optional[float] = None,
     expected_dx: Optional[float] = None,
+    ncc_prior_window: int = 250,
+    tile_cache: Optional[Dict[int, TileCacheEntry]] = None,
 ) -> PairResult:
     """Full pair stitching pipeline with verification and fallbacks.
 
@@ -1121,8 +1329,20 @@ def stitch_pair(
     row_prior_dx / expected_dx: optional horizontal-shift priors used only
     when a pair's dx is ambiguous (flat correlation ridge); see
     `stitch_pair_ncc`.
+
+    ncc_prior_window: when `row_prior_dx` is set, the NCC scan's dx range
+    is narrowed to +-this many px around the prior (optimization No2).
+    Quality-neutral: the first 1-2 pairs of a row have no prior, so
+    they scan the full range as before.
+
+    tile_cache: per-tile cache of CLAHE BGR, CLAHE grayscale, SIFT
+    keypoints and descriptors, keyed by `id(img)` (optimization No1).
+    When provided, an interior tile (right of pair i-1, left of pair
+    i) is only CLAHE'd and SIFT'd ONCE. The pipeline creates one
+    fresh cache per row.
     """
-    ga, gb = _prepare_gray(img_a, img_b, use_clahe=use_clahe, clahe_clip=clahe_clip)
+    ga, gb = _prepare_gray(img_a, img_b, use_clahe=use_clahe, clahe_clip=clahe_clip,
+                           tile_cache=tile_cache, n_features=n_features)
 
     # 1. SIFT
     result = stitch_pair_sift(
@@ -1133,6 +1353,7 @@ def stitch_pair(
         use_clahe=use_clahe,
         clahe_clip=clahe_clip,
         suppress_fixed_pattern=suppress_fixed_pattern,
+        tile_cache=tile_cache,
     )
     sift_ok = result.success and result.inliers >= min_inliers_sift
 
@@ -1143,6 +1364,8 @@ def stitch_pair(
         ncc_result = stitch_pair_ncc(
             img_a, img_b, use_clahe=use_clahe, gray=(ga, gb),
             row_prior_dx=row_prior_dx, expected_dx=expected_dx,
+            ncc_prior_window=ncc_prior_window,
+            tile_cache=tile_cache, n_features=n_features,
         )
 
     # 3. Verification of a successful SIFT result
@@ -1181,6 +1404,7 @@ def stitch_pair(
                 suppress_fixed_pattern=suppress_fixed_pattern,
                 prior_translation=(ncc_result.ncc_best[0], ncc_result.ncc_best[1]),
                 prior_window=60.0,
+                tile_cache=tile_cache,
             )
             if refined.success and refined.inliers >= min_inliers_sift:
                 rdx, rdy = refined.translation
@@ -1225,7 +1449,9 @@ def stitch_pair(
     # 4. Fallbacks when SIFT failed
     if enable_phase_fallback:
         phase_result = stitch_pair_phase(img_a, img_b, use_clahe=use_clahe,
-                                         gray=(ga, gb))
+                                         gray=(ga, gb), clahe_clip=clahe_clip,
+                                         tile_cache=tile_cache,
+                                         n_features=n_features)
         if phase_result.success:
             if result.inliers > 0:
                 sift_dx = result.translation[0]

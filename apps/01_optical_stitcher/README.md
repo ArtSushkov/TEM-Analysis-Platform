@@ -11,11 +11,24 @@ Preparing cross-sections for TEM often requires inspecting the disk surface on a
 ## Features
 
 - **Automatic relative position estimation** between adjacent images (SIFT + RANSAC)
+- **Region of interest (ROI) crop** — auto-detect or manually correct a horizontal
+  band on each tile (typically the ~1/4 of the frame that contains the visible
+  cross-section of the TEM disk). The crop runs BEFORE SIFT/NCC/blending, giving
+  ~4x speedup and ~4x smaller panorama on 20 MP frames. Per-tile offset
+  correction in Pair Review when the operator shifted the disk vertically.
 - **Pair Review tab** — verify every pair visually and adjust positions by hand
 - **No-overlap pairs** — mark accidentally non-overlapping shots with a checkbox;
   they are placed side by side with a visible black gap on the panorama
+- **Static side-by-side pair preview** — overlay views can hide a wrong dx/dy
+  behind averaging; the new side-by-side mode shows both tiles in full next to
+  each other with seam markers, so misalignment is immediately visible
 - **Robust to dark images** via CLAHE preprocessing
 - **Multi-band blending** — invisible seams even with blurred tile edges
+- **Focus-priority blending (default)** — in the overlap zone, the tile with
+  the highest Tenengrad sharpness score wins the high-frequency content; low
+  frequencies are still averaged so brightness stays smooth. Use this when the
+  operator focused each frame on a different depth and the goal is to see the
+  sharpest detail rather than a smoothly-averaged picture
 - **Fallback strategies**: phase correlation and NCC scan in case SIFT fails
 - **TIFF support (including LZW compression)**, PNG, JPEG
 - **Full diagnostics**: method, match/inlier counts, estimated shifts, position map
@@ -81,8 +94,51 @@ In the sidebar, choose the upload method:
 
 ### 4. Configure Settings (optional)
 
-The sidebar exposes settings for feature detection, preprocessing, and blending.
-See the in-app **Help** tab for a detailed explanation of each setting.
+The sidebar exposes settings for feature detection, preprocessing, blending,
+and region of interest (ROI). See the in-app **Help** tab for a detailed
+explanation of each setting.
+
+### 4b. Region of interest (ROI) — when only a horizontal strip of the frame matters
+
+If the visible cross-section of the TEM disk occupies only a horizontal strip
+of each frame (typically ~1/4 of the frame height — the rest is empty
+microscope background), enable **Crop tiles to ROI band** in the sidebar's
+**Region of interest** section:
+
+- **Auto (reference tile 1) — same band on every tile** (default, recommended):
+  the app detects the textured band on the FIRST tile (a window of the
+  requested height, centred on the per-row Tenengrad energy centroid of the
+  disk band — robust to dust specks) and applies the SAME band to every tile.
+  You verify / correct it visually in Pair Review Step 3 (interactive vertical
+  offset slider on tile 1; the band height is set by the sidebar
+  "ROI height (fraction of tile height)" slider) or in the Stitcher's
+  "ROI band preview" expander (same offset slider, synchronised). Because the
+  band is identical
+  on every tile, Pair Review positions transfer exactly — no vertical blur at
+  the seams.
+- **Auto-detect per tile (advanced)**: each tile gets its own band (use ONLY
+  when the disk moved vertically a LOT between shots) and its own offset (px)
+  slider — in the Stitcher's "ROI band preview" expander and in Pair Review
+  Step 3 (the same sliders, synchronised). The band height always comes from
+  the sidebar "ROI height (fraction of tile height)" slider. When the per-tile
+  bands differ, the pipeline automatically converts pair dy between the
+  full-tile and cropped-tile frames — but the safest workflow is still
+  reference tile 1.
+- **Also keep full panorama (debug)**: when ON AND a single ROI band is
+  applied to every tile, the pipeline ALSO blends a full-resolution panorama
+  without cropping, available as a separate download. Costs one EXTRA blend
+  pass — keep OFF for production runs.
+
+The crop happens BEFORE SIFT / NCC / blending, so on 20 MP frames with a
+1/3-frame band the whole pipeline runs ~3x faster and produces a panorama
+~3x smaller in height. The crop is vertical only — horizontal overlap
+between adjacent tiles is preserved, so pairwise alignment is unaffected.
+
+In the **Pair Review** tab, **Step 3** shows the reference tile with its
+ROI band drawn on top. Tune the **Vertical offset** slider (the band height
+is set by the sidebar **ROI height (fraction of tile height)** slider) until
+the band brackets the disk the way you want — the SAME band is
+then applied to every tile (a preview grid shows the band on tiles 2..N).
 
 ### 5. Pair Review (manual alignment, recommended for hand-captured rows)
 
@@ -125,23 +181,36 @@ Click **Stitch panorama** (Stitcher tab) or **Stitch panorama with these positio
 ```
 [Load N images, sort by _N]
     |
-[CLAHE preprocessing — boost contrast]
+[Auto-detect / manually correct a horizontal ROI band on every tile
+ (Tenengrad energy centroid +/- ~2 sigma; per-tile offset sliders
+  in the Stitcher ROI preview / Pair Review Step 3 when the disk
+  moved vertically between shots)]
     |
-[Pairwise stitching i <-> i+1]:
+[Downscale tiles for estimation (max side 1600 px by default)]
+    |
+[Pairwise stitching i <-> i+1]  (on the downscaled copies — ~9-13x faster):
    1. SIFT detector + FLANN matcher
    2. Lowe ratio test -> good matches
    3. RANSAC + estimateAffinePartial2D
    4. Fallback: phase correlation
    5. Fallback: NCC scan (if all else fails)
     |
+[Scale shifts back to full resolution + full-res ECC polish (sub-pixel)]
+    |
 [Compute cumulative absolute positions]
     |
-[Multi-band blending]:
-   - Laplacian pyramid (5 levels)
-   - Weighted average per level
+[Multi-band blending]  (always at FULL resolution of the ROI-cropped tiles):
+   - Laplacian pyramid (3 levels by default)
+   - Focus-priority weight mode by default: in the overlap zone the tile
+     with the highest Tenengrad sharpness score wins the high-frequency
+     content; low frequencies are still averaged with a feather mask
    - Gain compensation between tiles
     |
-[Panorama + diagnostics]
+[Optional debug full-resolution panorama (no ROI crop) — when
+ "Also keep full panorama (debug)" is ON and a single ROI band
+  was applied to every tile]
+    |
+[Panorama (ROI-cropped) + optional panorama_full (debug) + diagnostics]
 ```
 
 ## Limitations
@@ -158,25 +227,33 @@ Click **Stitch panorama** (Stitcher tab) or **Stitch panorama with these positio
 ├── README.md
 └── src/
     ├── __init__.py
-    ├── io_utils.py         # Loading + _N parsing + sorting
-    ├── preprocessing.py    # CLAHE + sharpness map
+    ├── io_utils.py         # Loading + _N parsing + sorting + ROI band helpers
+    ├── preprocessing.py    # CLAHE + sharpness/Tenengrad maps + feather mask
     ├── stitching.py        # SIFT+RANSAC + fallbacks
-    ├── pair_review.py      # Review-scale estimation + overlay previews + JSON session
-    ├── blending.py         # Multi-band blending (memory-optimized)
-    └── pipeline.py         # Orchestration (+ reviewed-position overrides)
+    ├── pair_review.py      # Review-scale estimation + overlay/static previews
+    │                       #   + ROI overlay rendering + JSON session
+    ├── blending.py         # Multi-band blending (memory-optimized, focus-priority)
+    └── pipeline.py         # Orchestration (+ reviewed-position overrides + ROI)
 ```
 
 ## Troubleshooting
 
 See the in-app **Help** tab for a full troubleshooting guide. The most common issues:
 
-- **"Unable to allocate ... GiB" (OOM)**: reduce `Laplacian pyramid levels` to 3-4
-- **Dark zone at the panorama edge**: keep `Blending weight mode` on `Feather (default)`
+- **"Unable to allocate ... GiB" (OOM)**: enable the ROI crop in the sidebar (Region of interest
+  → Crop tiles to ROI band) — on 20 MP frames whose disk occupies ~1/4 of the frame height this
+  shrinks the canvas ~4x in height; also try reducing `Laplacian pyramid levels` to 3–4
+- **Dark zone at the panorama edge**: switch `Blending weight mode` to `Focus-priority (default)`
+  or `Feather` — both are safe on dark images. The `Focus-weighted (per-tile)` mode is a legacy
+  option that can fail in non-overlap zones on near-zero-sharpness dark frames
 - **Visible seam**: increase `Laplacian pyramid levels` to 6-7 and `Gain compensation` to 1.0
+- **ROI band missed the disk on some tile**: in Pair Review → Step 3, use the Vertical offset
+  correction slider for that tile to shift the band up or down
 - **Want the sharpest detail to win in the overlap zone** (operator focused each frame on a
-  different depth): switch `Blending weight mode` to `Focus-priority (cross-tile)` — the tile
-  with the highest Tenengrad focus score wins the high-frequency content; low frequencies are
-  still averaged so brightness stays smooth and residual alignment errors are not revealed
+  different depth): keep `Blending weight mode` on `Focus-priority (default)` (this is now the
+  default) — the tile with the highest Tenengrad focus score wins the high-frequency content;
+  low frequencies are still averaged so brightness stays smooth and residual alignment errors
+  are not revealed
 - **All methods failed**: increase `SIFT features` to 10000, lower `Lowe ratio threshold` to 0.7
 
 ## License

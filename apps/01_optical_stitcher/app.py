@@ -6,6 +6,7 @@ Run:
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import sys
@@ -114,28 +115,432 @@ def _blend_mode_params() -> dict:
     `stitch_row()` call sites stay in sync with the sidebar.
 
     Radio modes:
-      "Feather (default)"            -> feather mask only
+      "Feather"                      -> feather mask only
       "Focus-weighted (per-tile)"    -> legacy focus_weight_mask
-      "Focus-priority (cross-tile)"  -> winner-takes-all at high freq
+      "Focus-priority (default)"     -> winner-takes-all at high freq
     """
-    mode = st.session_state.get("blend_weight_mode", "Feather (default)")
+    mode = st.session_state.get("blend_weight_mode", "Focus-priority (default)")
     if mode == "Focus-weighted (per-tile)":
         return {
             "blend_use_focus_weights": True,
             "blend_focus_priority": False,
         }
-    if mode == "Focus-priority (cross-tile)":
+    if mode == "Focus-priority (default)":
         return {
             "blend_use_focus_weights": False,
             "blend_focus_priority": True,
             "blend_focus_priority_gamma": _param("focus_priority_gamma", 6.0),
             "blend_focus_priority_levels": _param("focus_priority_levels", 2),
         }
-    # Feather (default) and any unknown value
+    # Feather and any unknown value
     return {
         "blend_use_focus_weights": False,
         "blend_focus_priority": False,
     }
+
+
+# === ROI mode constants (sidebar radio options — single source of truth) ===
+_ROI_MODE_REF1 = "Auto (reference tile 1) — same band on every tile"
+_ROI_MODE_PER_TILE = "Auto-detect per tile (advanced)"
+
+
+def _roi_sig_hash(sig):
+    """Short stable hash of the upload signature (widget keys / caches)."""
+    return hashlib.md5(repr(sig).encode("utf-8")).hexdigest()[:8]
+
+
+def _roi_ref_off(sig_hash):
+    """Shared reference-band vertical offset (px), keyed by the upload
+    signature.
+
+    Edited from BOTH the Stitcher ROI preview slider and the Pair Review
+    Step 3 slider — the two stay in sync via on_change callbacks, so the
+    preview and the stitch always use the same band.
+
+    The band HEIGHT is deliberately NOT stored here: it is governed by
+    the sidebar "ROI height (fraction of tile height)" slider only (the
+    old Pair Review "Band height (px)" slider was removed — it
+    duplicated the sidebar control). A height value left over in
+    session state from an older version is ignored.
+    """
+    d = st.session_state.get("roi_ref1_adj")
+    if not (isinstance(d, dict) and d.get("sig") == sig_hash):
+        return 0
+    try:
+        return int(d.get("off", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _roi_ref_set(sig_hash, **upd):
+    """Merge updates into the shared reference-band adjustment."""
+    d = st.session_state.get("roi_ref1_adj")
+    d = dict(d) if isinstance(d, dict) and d.get("sig") == sig_hash \
+        else {"sig": sig_hash}
+    d.update(upd)
+    st.session_state["roi_ref1_adj"] = d
+
+
+def _roi_ref_off_cb(sig_hash, src_key):
+    """on_change callback for the offset slider: store the value and keep
+    the sibling slider (the same control rendered in the other tab) in
+    sync. Runs before the rerun instantiates widgets, so mutating
+    session_state here is legal."""
+    v = int(st.session_state.get(src_key, 0) or 0)
+    _roi_ref_set(sig_hash, off=v)
+    for k in (f"st_roi_ref_off_{sig_hash}", f"rvp_roi_ref_off_{sig_hash}"):
+        if k != src_key:
+            st.session_state[k] = v
+
+
+def _roi_pt_off(sig_hash, k):
+    """Shared per-tile vertical offset (px) for the "Auto-detect per
+    tile (advanced)" mode, keyed by the upload signature. Tile k's
+    offset shifts that tile's own auto-detected band; the band height
+    always comes from the sidebar "ROI height (fraction of tile
+    height)" slider.
+
+    Edited from BOTH the Stitcher per-tile ROI preview and the Pair
+    Review Step 3 sliders — one state, synchronised by on_change
+    callbacks, so the previews and the stitch always use the same
+    bands.
+    """
+    d = st.session_state.get("roi_pt_adj")
+    if not (isinstance(d, dict) and d.get("sig") == sig_hash):
+        return 0
+    try:
+        return int((d.get("offs") or {}).get(str(k), 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _roi_pt_off_cb(sig_hash, k, src_key):
+    """on_change callback for a per-tile offset slider: store the value
+    and keep the sibling slider (the same control rendered in the other
+    tab) in sync. Runs before the rerun instantiates widgets, so
+    mutating session_state here is legal."""
+    v = int(st.session_state.get(src_key, 0) or 0)
+    d = st.session_state.get("roi_pt_adj")
+    d = dict(d) if isinstance(d, dict) and d.get("sig") == sig_hash \
+        else {"sig": sig_hash}
+    offs = dict(d.get("offs") or {})
+    offs[str(k)] = v
+    d["offs"] = offs
+    st.session_state["roi_pt_adj"] = d
+    for prefix in (f"st_roi_pt_off_{sig_hash}_",
+                   f"rvp_roi_pt_off_{sig_hash}_"):
+        kk = f"{prefix}{k}"
+        if kk != src_key:
+            st.session_state[kk] = v
+
+
+def _shift_band(band, off, h):
+    """Vertically shift an ROI band by `off` px, clamped to the tile.
+
+    The band height is preserved (only the position moves); y0 / y1
+    stay inside [0, h] and the band never collapses (y1 > y0).
+    """
+    y0 = max(0, min(h - 1, int(band[0]) + int(off)))
+    y1 = max(y0 + 1, min(h, int(band[1]) + int(off)))
+    return (y0, y1)
+
+
+def _auto_band_bounds(h_frac):
+    """Detection clamp bounds used with `auto_detect_roi_band`.
+
+    These mirror `io_utils.roi_band_for_tiles(mode="auto")` so BOTH ROI
+    modes honour the sidebar "ROI height (fraction of tile height)"
+    slider EXACTLY (up to 1.0). Relying on the helper's own conservative
+    default cap (max_fraction=0.50) silently clipped the window at half
+    the tile height in the reference-tile-1 mode — the "window never
+    grows beyond 0.5" bug.
+    """
+    return max(0.10, h_frac - 0.10), min(1.0, h_frac + 0.25)
+
+
+def _roi_ref_band(img, sig_hash, h_frac):
+    """Auto-detected tile-1 band plus the shared vertical offset.
+
+    Returns (auto_band, applied_band). Used by the Stitcher preview,
+    the Stitch button and Pair Review so all three always agree. The
+    band height comes ONLY from `h_frac` (the sidebar "ROI height
+    (fraction of tile height)" slider) and is honoured up to the full
+    tile height; the offset is the shared user adjustment.
+    """
+    lo, hi = _auto_band_bounds(h_frac)
+    auto = io_utils.auto_detect_roi_band(
+        img, target_fraction=h_frac, min_fraction=lo, max_fraction=hi)
+    h0 = int(img.shape[0])
+    return auto, _shift_band(auto, _roi_ref_off(sig_hash), h0)
+
+
+def _roi_auto_bands_cached(tiles, h_frac):
+    """Auto-detected per-tile ROI bands, cached in session_state.
+
+    Detection (per-row Tenengrad on every tile) depends ONLY on the
+    upload and the sidebar fraction — NOT on the per-tile offsets — so
+    it runs ONCE per (upload, fraction). Moving one tile's offset
+    slider then re-uses these bands instead of re-scanning every tile,
+    which is what makes the update touch only the edited tile.
+    """
+    sig = _current_upload_signature()
+    sig_hash = _roi_sig_hash(sig) if sig is not None else "default"
+    cache = st.session_state.get("roi_auto_bands_cache")
+    if not (isinstance(cache, dict)
+            and cache.get("sig") == sig_hash
+            and cache.get("h_frac") == h_frac
+            and isinstance(cache.get("bands"), list)
+            and len(cache["bands"]) == len(tiles)):
+        bands = io_utils.roi_band_for_tiles(
+            tiles, mode="auto", target_fraction=h_frac)
+        cache = {"sig": sig_hash, "h_frac": h_frac, "bands": bands}
+        st.session_state["roi_auto_bands_cache"] = cache
+    return cache["bands"]
+
+
+def _roi_overlay_cached(sig_hash, k, image, band, out_width):
+    """`pair_review.render_tile_with_roi_overlay` with a session cache
+    keyed by (upload, tile, band, width).
+
+    Moving ONE tile's offset slider changes only that tile's band; the
+    overlays of all other tiles are reused from this cache instead of
+    being re-drawn from the full-resolution frames on every rerun.
+    """
+    cache = st.session_state.get("roi_overlay_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state["roi_overlay_cache"] = cache
+    ckey = (sig_hash, int(k), int(band[0]), int(band[1]), int(out_width))
+    out = cache.get(ckey)
+    if out is None:
+        out = pair_review.render_tile_with_roi_overlay(
+            image, band, out_width=out_width)
+        if len(cache) >= 128:
+            cache.clear()
+        cache[ckey] = out
+    return out
+
+
+def _resolve_roi_band_for_stitcher(tiles):
+    """Read the ROI sidebar settings and compute the ROI band to apply.
+
+    Returns (roi_band, roi_bands_per_tile, roi_label, keep_full) where
+    exactly ONE of roi_band / roi_bands_per_tile is not None (or both are
+    None when ROI is disabled). roi_label is a short human-readable
+    description for the Stitcher preview caption. keep_full echoes the
+    sidebar "Also keep full panorama (debug)" checkbox.
+
+    Modes (sidebar radio "ROI detection mode"):
+    - "Auto (reference tile 1) ..." (DEFAULT): detect the textured band
+      on tile 1 only and apply the SAME band to every tile. The band can
+      be shifted interactively (Stitcher ROI preview slider and Pair
+      Review Step 3 sliders share ONE state); the shift is applied here
+      too, so the preview and the stitched panorama always agree. Single
+      band => Pair Review translations transfer exactly (no per-tile dy
+      conversion needed), so the seams stay sharp.
+    - "Auto-detect per tile (advanced)": per-tile bands, each one
+      shifted by its own interactive offset (the Stitcher per-tile ROI
+      preview and the Pair Review Step 3 sliders share ONE state — the
+      offsets are applied here too, so the previews and the stitched
+      panorama always agree). The band heights always come from the
+      sidebar "ROI height (fraction of tile height)" slider. When the
+      resulting bands differ, roi_bands_per_tile is returned and
+      pipeline.stitch_row converts pair dy between the full-tile and
+      cropped-tile frames automatically.
+
+    Any other stored mode value (e.g. the "Manual ..." mode removed in
+    an older version) safely falls back to the default reference-tile-1
+    behaviour.
+    """
+    if not _param("roi_enabled", True):
+        return None, None, "", False
+    mode = _param("roi_mode", _ROI_MODE_REF1)
+    h_frac = float(_param("roi_height_fraction", 0.30))
+    keep_full = bool(_param("keep_full_panorama", False))
+    if mode == _ROI_MODE_PER_TILE:
+        sig = _current_upload_signature()
+        sig_hash = _roi_sig_hash(sig) if sig is not None else "default"
+        auto_bands = io_utils.roi_band_for_tiles(
+            tiles, mode="auto", target_fraction=h_frac,
+        )
+        # Apply each tile's shared interactive offset (default 0). These
+        # are the SAME values the previews show — single state for the
+        # Stitcher preview, Pair Review Step 3 and the stitch itself.
+        bands = [
+            _shift_band(b, _roi_pt_off(sig_hash, k), int(t.image.shape[0]))
+            for k, (b, t) in enumerate(zip(auto_bands, tiles))
+        ]
+        if len(set(bands)) == 1:
+            b = bands[0]
+            return b, None, f"auto per tile (all agreed) y=[{b[0]},{b[1]})", keep_full
+        return None, bands, "auto per tile (bands differ — dy auto-converted)", keep_full
+    # Default: Auto (reference tile 1) + the shared interactive offset /
+    # height adjustment (single source of truth for preview and stitch)
+    sig = _current_upload_signature()
+    sig_hash = _roi_sig_hash(sig) if sig is not None else "default"
+    auto_band, band = _roi_ref_band(tiles[0].image, sig_hash, h_frac)
+    label = (f"reference tile 1 y=[{band[0]},{band[1]}) "
+             f"(auto y=[{auto_band[0]},{auto_band[1]}]) — same on every tile")
+    return band, None, label, keep_full
+
+
+# Scoped reruns: Streamlit >= 1.39 supports @st.fragment — a widget
+# inside the fragment then re-renders ONLY the fragment (here: the
+# per-tile ROI grids), not the whole page. Older versions (the project
+# pins streamlit>=1.30) get a no-op decorator; the caches above still
+# keep those interactions fast there.
+if hasattr(st, "fragment"):
+    _scope_to_widget = st.fragment
+else:  # pragma: no cover - legacy Streamlit fallback
+    def _scope_to_widget(fn):
+        return fn
+
+
+@_scope_to_widget
+def _render_roi_preview_stitcher(tiles, h_frac):
+    """Interactive per-tile ROI preview for "Auto-detect per tile" mode.
+
+    Mirrors Pair Review Step 3's advanced layout: one "offset (px)"
+    slider per tile shifts that tile's own auto-detected band, and the
+    band height always comes from the sidebar "ROI height (fraction of
+    tile height)" slider. The sliders share ONE state with Pair Review
+    Step 3 (synchronised by on_change callbacks), and
+    `_resolve_roi_band_for_stitcher` applies the same offsets when the
+    Stitch button runs — the preview and the panorama always agree.
+
+    Runs as a Streamlit fragment (when supported): moving one tile's
+    slider re-renders only THIS block. The auto-detected bands and the
+    tile overlays are cached (`_roi_auto_bands_cached` /
+    `_roi_overlay_cached`), so only the edited tile is actually
+    recomputed / re-drawn — the other tiles' previews are reused as-is.
+    """
+    sig = _current_upload_signature()
+    sig_hash = _roi_sig_hash(sig) if sig is not None else "default"
+    n = len(tiles)
+    st.caption(
+        "**Advanced per-tile mode.** Each tile gets its own auto-detected "
+        "band (height from **ROI height (fraction of tile height)** in "
+        "the sidebar). Use the per-tile offset (px) sliders below only "
+        "if a band missed the disk on that tile — the SAME sliders are "
+        "available in Pair Review Step 3 and the two stay in sync.")
+    n_cols = min(4, max(2, n))
+    cols = st.columns(n_cols)
+    auto_bands = _roi_auto_bands_cached(tiles, h_frac)
+    for k, tile_k in enumerate(tiles):
+        with cols[k % n_cols]:
+            y0_a, y1_a = auto_bands[k]
+            hk = int(tile_k.image.shape[0])
+            off_key = f"st_roi_pt_off_{sig_hash}_{k}"
+            st.slider(
+                f"#{tile_k.index} {tile_k.name} — offset (px)",
+                min_value=-hk // 2, max_value=hk // 2,
+                value=_roi_pt_off(sig_hash, k), step=5, key=off_key,
+                on_change=(lambda s=sig_hash, kk=k, key_=off_key:
+                           _roi_pt_off_cb(s, kk, key_)),
+                help=("Shift this tile's ROI band up (negative) or down "
+                      "(positive). Auto-detected band: "
+                      f"y=[{y0_a},{y1_a}) of {hk} px. Synchronised with "
+                      "the slider in Pair Review Step 3."),
+            )
+            band_k = _shift_band(auto_bands[k], _roi_pt_off(sig_hash, k),
+                                 hk)
+            prev_k = _roi_overlay_cached(sig_hash, k, tile_k.image, band_k,
+                                         300)
+            st.image(prev_k, use_container_width=True)
+            st.caption(f"band y=[{band_k[0]},{band_k[1]}) "
+                       f"({band_k[1] - band_k[0]} px of {hk} px)")
+
+
+@_scope_to_widget
+def _render_pair_review_per_tile_grid(tiles, auto_bands_full, sig_hash_pt):
+    """Per-tile ROI grid of Pair Review Step 3 (advanced mode).
+
+    Runs as a Streamlit fragment (when supported): moving one tile's
+    offset slider re-renders ONLY this grid — the rest of Pair Review
+    (pair previews, other Steps) stays untouched. The overlays are
+    cached (`_roi_overlay_cached`), so tiles whose band did not change
+    are reused as-is; only the edited tile is re-drawn.
+    """
+    n = len(tiles)
+    n_cols_roi = min(4, max(2, n))
+    roi_cols = st.columns(n_cols_roi)
+    for k, tile_k in enumerate(tiles):
+        with roi_cols[k % n_cols_roi]:
+            y0_a, y1_a = auto_bands_full[k]
+            hk = int(tile_k.image.shape[0])
+            off_key = f"rvp_roi_pt_off_{sig_hash_pt}_{k}"
+            st.slider(
+                f"#{tile_k.index} {tile_k.name} — offset (px)",
+                min_value=-hk // 2, max_value=hk // 2,
+                value=_roi_pt_off(sig_hash_pt, k), step=5,
+                key=off_key,
+                on_change=(lambda s=sig_hash_pt, kk=k, key_=off_key:
+                           _roi_pt_off_cb(s, kk, key_)),
+                help=("Shift this tile's ROI band up (negative) or "
+                      "down (positive). Auto-detected band: "
+                      f"y=[{y0_a},{y1_a}) of {hk} px. "
+                      "Synchronised with the slider in the "
+                      "Stitcher tab ROI preview."))
+            band_k = _shift_band(auto_bands_full[k],
+                                 _roi_pt_off(sig_hash_pt, k), hk)
+            prev_roi = _roi_overlay_cached(sig_hash_pt, k, tile_k.image,
+                                           band_k, 300)
+            st.image(prev_roi, use_container_width=True)
+            st.caption(f"band y=[{band_k[0]},{band_k[1]}) "
+                       f"({band_k[1] - band_k[0]} px)")
+
+
+def _render_stitcher_roi_reference_ui(tiles, h_frac):
+    """Interactive ROI preview for the "Auto (reference tile 1)" mode.
+
+    A slider shifts the tile-1 band up / down (shared with Pair Review
+    Step 3 — one state, synchronised by callbacks). Tile 1 is shown with
+    the applied band; tiles 2..N are shown with BOTH the applied band
+    and their OWN auto-detected band, so the user can judge how the
+    window lands relative to the disk on every tile BEFORE spending
+    time on a full stitch.
+    """
+    sig = _current_upload_signature()
+    sig_hash = _roi_sig_hash(sig) if sig is not None else "default"
+    h0 = int(tiles[0].image.shape[0])
+    off_key = f"st_roi_ref_off_{sig_hash}"
+    auto_band, band = _roi_ref_band(tiles[0].image, sig_hash, h_frac)
+    st.slider(
+        "Vertical offset of the ROI window (px) — shifts the band on "
+        "EVERY tile", -h0 // 2, h0 // 2,
+        value=_roi_ref_off(sig_hash), step=5, key=off_key,
+        on_change=(lambda s=sig_hash, k=off_key: _roi_ref_off_cb(s, k)),
+        help=("Shift the ROI window of tile 1 up (negative) or down "
+              f"(positive). Auto-detected position: y=[{auto_band[0]},"
+              f"{auto_band[1]}) of {h0} px. The SAME y-window is applied "
+              "to every tile; the previews below show how it lands "
+              "relative to each tile's own auto-detected band."),
+    )
+    prev = pair_review.render_tile_with_roi_overlay(
+        tiles[0].image, band, out_width=520)
+    st.image(prev, use_container_width=True)
+    st.caption(f"Applied band y=[{band[0]},{band[1]}) "
+               f"({band[1] - band[0]} px of {h0} px = "
+               f"{100.0 * (band[1] - band[0]) / h0:.0f}% of the tile "
+               f"height, set by the sidebar ROI height (fraction) "
+               f"slider) — the same band is applied to all "
+               f"{len(tiles)} tiles.")
+    if len(tiles) > 1:
+        with st.expander(
+                f"Applied band vs each tile's own auto-detected band "
+                f"(tiles 2..{len(tiles)})", expanded=False):
+            n_rest = len(tiles) - 1
+            cols = st.columns(min(4, max(2, n_rest)))
+            own_bands = _roi_auto_bands_cached(tiles, h_frac)[1:]
+            for j, tile_k in enumerate(tiles[1:]):
+                with cols[j % min(4, max(2, n_rest))]:
+                    prev_k = pair_review.render_tile_with_two_roi_overlays(
+                        tile_k.image, band, own_bands[j], out_width=220)
+                    st.image(prev_k, use_container_width=True)
+                    st.caption(
+                        f"#{tile_k.index} {tile_k.name}: applied "
+                        f"y=[{band[0]},{band[1]}) | own "
+                        f"y=[{own_bands[j][0]},{own_bands[j][1]})")
 
 
 def _current_upload_signature():
@@ -305,6 +710,36 @@ def render_stitch_result(result, tiles):
         mime=mime,
     )
 
+    # Optional debug full-resolution panorama (when keep_full_panorama was ON
+    # AND a single ROI band was applied — see pipeline.stitch_row docs).
+    pan_full = getattr(result, "panorama_full", None)
+    if pan_full is not None:
+        st.caption(
+            f"Debug full-resolution panorama (no ROI crop): "
+            f"{pan_full.shape[1]}x{pan_full.shape[0]} px.")
+        if ext == "tif":
+            import tifffile
+            rgb_f = cv2.cvtColor(pan_full, cv2.COLOR_BGR2RGB)
+            buf_f = io.BytesIO()
+            tifffile.imwrite(buf_f, rgb_f, compression="lzw")
+            data_f = buf_f.getvalue()
+            mime_f = "image/tiff"
+        elif ext == "png":
+            _, buf_f = cv2.imencode(".png", pan_full)
+            data_f = buf_f.tobytes()
+            mime_f = "image/png"
+        else:
+            _, buf_f = cv2.imencode(".jpg", pan_full,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+            data_f = buf_f.tobytes()
+            mime_f = "image/jpeg"
+        st.download_button(
+            label=f"Download panorama (FULL — debug, {out_format})",
+            data=data_f,
+            file_name=f"panorama_{len(tiles)}_tiles_full.{ext}",
+            mime=mime_f,
+        )
+
     # CSV with tile positions
     import csv
     csv_buf = io.StringIO()
@@ -358,11 +793,15 @@ def render_help_tab():
         "with a visible black band on the panorama, and its checkbox counts "
         "as approved."
         "\n"
-        "3. **Step 3 — Adjust**: every unticked pair gets manual controls — "
+        "3. **Step 3 — Region of interest**: the tiles are cropped to a "
+        "horizontal ROI band — auto-detected, shown on every tile and "
+        "interactively adjustable."
+        "\n"
+        "4. **Step 4 — Adjust**: every unticked pair gets manual controls — "
         "nudge buttons (1–100 px steps) and numeric dx/dy inputs, with a live "
         "overlay that updates on every click."
         "\n"
-        "4. **Step 4 — Stitch**: the panorama is blended using **exactly** the "
+        "5. **Step 5 — Stitch**: the panorama is blended using **exactly** the "
         "reviewed positions — approved pairs are taken as-is, manually adjusted "
         "pairs are placed exactly where you put them."
     )
@@ -383,7 +822,7 @@ def render_help_tab():
         "- The automatic estimate is skipped entirely in the final stitch — no "
         "algorithm can override what you approved."
         "\n"
-        "- **Export positions (JSON)** in Step 4 saves your work (positions, "
+        "- **Export positions (JSON)** in Step 5 saves your work (positions, "
         "approvals, no-overlap marks); load it later in Step 1 to continue "
         "where you left off — useful because browser refreshes reset the "
         "interactive session."
@@ -446,7 +885,7 @@ def render_help_tab():
         "each frame on a different depth of the cross-section and the goal "
         "is to **see the sharpest detail** at every point rather than a "
         "smoothly-averaged picture, switch the **Blending weight mode** in "
-        "the sidebar to **Focus-priority (cross-tile)**. In the overlap "
+        "the sidebar to **Focus-priority (default)**. In the overlap "
         "zone, the tile whose Tenengrad focus measure is highest at a given "
         "pixel wins the high-frequency content (edges, fine detail); low "
         "frequencies are still averaged so brightness and illumination "
@@ -471,14 +910,87 @@ def render_help_tab():
     st.markdown("---")
     st.markdown("## Settings Reference")
 
+    st.markdown("### Region of interest (ROI)")
+    st.markdown(
+        "When the visible cross-section of the TEM disk occupies only a "
+        "horizontal strip of each frame (typically ~1/4 to ~1/3 of the "
+        "frame height — the rest is empty microscope background), cropping "
+        "each tile to that strip BEFORE stitching is the single biggest "
+        "speedup available after the downscale-for-estimation: roughly "
+        "(tile height / band height)x faster on SIFT/NCC/blend, with "
+        "the same memory reduction on the final panorama. The crop is "
+        "vertical only — horizontal overlap between adjacent tiles is "
+        "preserved, so pairwise alignment is unaffected."
+    )
+    st.markdown(
+        "| Setting | Default | Effect |"
+        "\n"
+        "|---|---|---|"
+        "\n"
+        "| **Crop tiles to ROI band** | ON | Master switch for the ROI "
+        "workflow. OFF = stitch full tiles (legacy behaviour). |"
+        "\n"
+        "| **ROI detection mode** | Auto (reference tile 1) | **Auto "
+        "(reference tile 1)** — DEFAULT and recommended: the app detects "
+        "the textured band on tile 1 (a window of the requested height, "
+        "centred on the per-row Tenengrad energy centroid of the disk "
+        "band, robust to dust specks) and applies the SAME band to every "
+        "tile. Because the band is identical on every tile, Pair Review "
+        "positions transfer exactly — no vertical blur at the seams. "
+        "The band can be shifted interactively in the Stitcher ROI "
+        "preview and in Pair Review Step 3 (the same offset slider, "
+        "synchronised). **Auto-detect per tile (advanced)** — per-tile "
+        "bands for heavy vertical drift, each with its own offset (px) "
+        "slider (the same sliders in the Stitcher ROI preview and Pair "
+        "Review Step 3 stay in sync); the pipeline converts pair dy "
+        "between the full-tile and cropped-tile frames "
+        "automatically. |"
+        "\n"
+        "| **ROI height (fraction)** | 0.30 | Target band height as a "
+        "fraction of tile height. 0.30 = central third (typical for a "
+        "TEM disk cross-section). Smaller = faster and smaller panorama, "
+        "but risks clipping the disk. Larger = safer, slower. |"
+        "\n"
+        "| **Also keep full panorama (debug)** | OFF | When ON AND a "
+        "single ROI band is applied to every tile (Auto reference-tile 1 "
+        "mode, with the interactive offset applied), the pipeline ALSO "
+        "blends a full-resolution "
+        "panorama without cropping, available as a separate download. "
+        "Costs one EXTRA blend pass — keep OFF for production runs. "
+        "Ignored (with a warning) when per-tile bands differ in the "
+        "advanced mode. |"
+    )
+    st.markdown(
+        "In the **Pair Review** tab, **Step 3** shows the reference tile "
+        "(tile 1) with its ROI band drawn on top. Tune the **Vertical "
+        "offset** slider until the band brackets the disk the way you "
+        "want — the band HEIGHT is set by the sidebar **ROI height "
+        "(fraction of tile height)** slider — and the SAME band is then "
+        "applied to every tile (a preview grid shows the band on tiles "
+        "2..N). In the advanced per-tile mode, each tile gets its own "
+        "offset slider. The Stitcher tab also shows an **ROI band "
+        "preview** expander before the Stitch button with the same "
+        "sliders, so you can verify the band before spending time on a "
+        "full stitch."
+    )
+
     st.markdown("### Feature Detection")
     st.markdown(
         "| Setting | Default | Effect |"
         "\n"
         "|---|---|---|"
         "\n"
-        "| **SIFT features (per tile)** | 5000 | Number of keypoints detected per tile. "
-        "Increase to 8000–10000 for low-contrast images. Decrease to 2000 for speed. |"
+        "| **Estimation resolution (max side, px)** | 1600 | Pairwise estimation "
+        "(SIFT + NCC) runs on downscaled copies whose longest side is at most this "
+        "size; the estimated shifts are scaled back up and polished at full "
+        "resolution with a quick ECC run. Blending ALWAYS happens at full resolution, "
+        "so the panorama quality is unchanged. 1600 px gives ~9-13x faster estimation "
+        "on 20 MP frames with no visible quality loss. Choose 'Full resolution' only "
+        "for tiny source images. |"
+        "\n"
+        "| **SIFT features (per tile)** | 2000 | Number of keypoints detected per tile. "
+        "2000 is enough for typical microscope pairs; raise to 5000-10000 only if "
+        "pairs fail to match. |"
         "\n"
         "| **Lowe ratio threshold** | 0.75 | Strictness of match filtering. "
         "Lower (0.7) = stricter, fewer but more reliable matches. "
@@ -541,18 +1053,18 @@ def render_help_tab():
         "\n"
         "|---|---|---|"
         "\n"
-        "| **Laplacian pyramid levels** | 5 | Number of frequency bands for multi-band blending. "
-        "More = smoother seams, but slower and uses more memory. "
-        "Reduce to 3–4 if you get OOM errors. |"
+        "| **Laplacian pyramid levels** | 3 | Number of frequency bands for multi-band blending. "
+        "More = smoother seams, but slower and uses more memory. 3 is a good "
+        "speed/quality balance; raise to 5 if seams are visible. |"
         "\n"
         "| **Feather zone width (px)** | 64 | Smooth mask falloff at tile edges. "
         "Larger = softer seam transition. |"
         "\n"
-        "| **Blending weight mode** | Feather (default) | Three mutually exclusive modes. "
+        "| **Blending weight mode** | Focus-priority (default) | Three mutually exclusive modes. "
         "**Feather** — smooth mask, robust on dark images; both tiles contribute to the seam "
         "(averaged). **Focus-weighted (per-tile)** — pixels in sharper zones of EACH tile "
         "get higher weight; per-tile normalization means sharpness is not compared across "
-        "tiles. **Focus-priority (cross-tile)** — in the overlap zone, the tile with the "
+        "tiles. **Focus-priority (default)** — in the overlap zone, the tile with the "
         "highest Tenengrad focus score wins the high-frequency content; low frequencies are "
         "still averaged so brightness stays smooth and residual alignment errors are not "
         "revealed. Use Focus-priority when the operator focused each frame on a different "
@@ -651,10 +1163,10 @@ def render_help_tab():
             "and the dark microscope images produce near-zero sharpness values, "
             "causing blending to fail in non-overlap zones."
             "\n\n"
-            "**Fix**: Switch **Blending weight mode** back to **Feather (default)**. "
-            "The feather mask is stable for dark images. **Focus-priority (cross-tile)** "
-            "is also safe on dark images — it always falls back to a feather mask in "
-            "non-overlap zones."
+            "**Fix**: Switch **Blending weight mode** to **Focus-priority (default)** "
+            "or **Feather**. Both are safe on dark images — Focus-priority always "
+            "falls back to a feather mask in non-overlap zones; the Focus-weighted "
+            "(per-tile) mode is a legacy option kept only for backward compatibility."
         )
 
     with st.expander("\"Unable to allocate ... GiB for an array\" (Out of Memory)"):
@@ -663,13 +1175,39 @@ def render_help_tab():
             "\n\n"
             "**Fixes**:"
             "\n"
-            "1. Reduce `Laplacian pyramid levels` to 3–4."
+            "1. **Enable the ROI crop** (sidebar: Region of interest → "
+            "Crop tiles to ROI band). On 20 MP frames whose disk occupies ~1/4 "
+            "of the frame height, the panorama canvas shrinks ~4x in height — "
+            "and the per-tile Laplacian/weight pyramids shrink with it."
             "\n"
-            "2. Keep **Blending weight mode** on **Feather (default)** — the legacy "
-            "Focus-weighted mode and the new Focus-priority mode each build one extra "
+            "2. Reduce `Laplacian pyramid levels` to 3–4."
+            "\n"
+            "3. Keep **Blending weight mode** on **Feather** — the legacy "
+            "Focus-weighted mode and the Focus-priority mode each build one extra "
             "per-tile weight pyramid (small, tile-sized, but non-zero)."
             "\n"
-            "3. For very large sets (>30 tiles), split into multiple panoramas."
+            "4. For very large sets (>30 tiles), split into multiple panoramas."
+        )
+
+    with st.expander("ROI band missed the disk on some tile"):
+        st.markdown(
+            "**Symptom**: In the Pair Review tab, Step 3 shows the yellow ROI "
+            "rectangle not bracketing the visible disk cross-section on one "
+            "or more tiles."
+            "\n\n"
+            "**Fix**: Use the **Vertical offset correction** slider under that "
+            "tile in Step 3 to shift the band up or down by up to ±half the "
+            "tile height. The auto-detect uses a Tenengrad energy profile and "
+            "occasionally picks the wrong band on a frame that is dominated by "
+            "background noise or by a single bright scratch; the manual slider "
+            "covers that case without forcing a full re-detect."
+            "\n\n"
+            "If the disk is genuinely in a different position on every tile "
+            "(operator hand-positioned the stage without locking Y), keep "
+            "**ROI detection mode** on **Auto-detect per tile (advanced)** so "
+            "each tile "
+            "gets its own band — combined with the per-tile offset sliders you "
+            "can recover the disk on every frame."
         )
 
     with st.expander("Visible seam between tiles"):
@@ -782,7 +1320,7 @@ def render_sidebar() -> None:
        or a ZIP archive in the sidebar to begin" — and (b) silently wiped
        the already-uploaded files, so going back to Stitcher showed the
        empty upload again.
-    2. Pair Review's Step 4 stitches with the Method Settings read via
+    2. Pair Review's Step 5 stitches with the Method Settings read via
        ``_param()``; if those widgets do not render, the defaults are used
        and the user cannot change them. Always-on sidebar makes the settings
        genuinely shared between the Stitcher and Pair Review workflows.
@@ -823,10 +1361,96 @@ def render_sidebar() -> None:
                  "samples): the app then prefers the alignment that matches "
                  "this overlap. 0 = unknown — fully automatic.")
 
+    with st.sidebar.expander("Region of interest (ROI)", expanded=False):
+        st.checkbox(
+            "Crop tiles to a horizontal ROI band before stitching",
+            value=True, key="roi_enabled",
+            help=(
+                "When ON, each tile is vertically cropped to a horizontal "
+                "band that brackets the visible part of the cross-section "
+                "(the TEM disk) BEFORE SIFT / NCC / blending run. Saves "
+                "roughly (tile height / band height)x on time, memory and "
+                "final panorama size. Only the Y axis is cropped — "
+                "horizontal overlap between adjacent tiles is preserved, "
+                "so pairwise alignment is unaffected. The Pair Review tab "
+                "shows the auto-detected band on every tile and lets you "
+                "correct the offset per tile if the disk moved vertically "
+                "between shots. OFF = stitch full tiles (legacy behaviour)."
+            ),
+        )
+        # Legacy sessions may still hold the removed "Manual ..." mode;
+        # drop it so the radio falls back to its default option.
+        if str(st.session_state.get("roi_mode", "")).startswith("Manual"):
+            st.session_state.pop("roi_mode", None)
+        st.radio(
+            "ROI detection mode",
+            options=[_ROI_MODE_REF1, _ROI_MODE_PER_TILE],
+            index=0, key="roi_mode",
+            help=(
+                "Auto (reference tile 1) \u2014 DEFAULT and recommended: "
+                "the app detects the textured band on the FIRST tile "
+                "and applies the SAME band to every tile. You can "
+                "verify / correct it visually in Pair Review Step 3 "
+                "(or in the Stitcher ROI preview, which has the same "
+                "offset slider right above the tile-1 preview). Because "
+                "the band is identical on every tile, Pair Review "
+                "translations transfer exactly \u2014 no vertical blur "
+                "at the seams. Auto-detect per tile (advanced): "
+                "each tile gets its own band (use ONLY when the disk "
+                "moved vertically a LOT between shots \u2014 the per-tile "
+                "dy is then converted automatically, but the safest "
+                "workflow is still reference tile 1)."
+            ),
+        )
+        st.slider(
+            "ROI height (fraction of tile height)", 0.15, 1.0, 0.30,
+            step=0.05, key="roi_height_fraction",
+            help=(
+                "Target band height as a fraction of the tile height. "
+                "0.25 = the central quarter (typical: the disk occupies "
+                "~1/4 of the frame height). Smaller = faster, smaller "
+                "panorama, but risks clipping the disk if the operator "
+                "moved it vertically. Larger = safer, slower."
+            ),
+        )
+        st.checkbox(
+            "Also keep full panorama (debug)",
+            value=False, key="keep_full_panorama",
+            help=(
+                "When ON AND a single ROI band is applied to every tile "
+                "(Auto (reference tile 1) mode, OR Auto-detect per tile "
+                "where all bands ended up identical), the pipeline ALSO "
+                "blends a full-resolution panorama without cropping, "
+                "returned as result.panorama_full. Costs one EXTRA blend "
+                "pass — keep OFF for production runs. Ignored (with a "
+                "warning) when the per-tile bands differ (the per-tile dy "
+                "conversion is incompatible with the full-tile "
+                "coordinate frame)."
+            ),
+        )
+
     with st.sidebar.expander("Feature Detection", expanded=True):
-        st.slider("SIFT features (per tile)", 500, 10000, 5000, step=500,
+        st.selectbox(
+            "Estimation resolution (max side, px)",
+            options=["Full resolution", 2000, 1600, 1200, 800],
+            index=2,
+            key="estimation_max_side",
+            help=(
+                "Pairwise estimation (SIFT + NCC) runs on downscaled "
+                "copies whose longest side is at most this size; the "
+                "estimated shifts are scaled back up and polished at full "
+                "resolution with a quick ECC run. Blending ALWAYS happens "
+                "at full resolution, so the panorama quality is unchanged. "
+                "1600 px gives ~9-13x faster estimation on 20 MP frames "
+                "with no visible quality loss. Choose 'Full resolution' "
+                "only for tiny source images."
+            ),
+        )
+        st.slider("SIFT features (per tile)", 500, 10000, 2000, step=500,
                   key="n_features",
-                  help="More = more robust but slower. 5000 is a good balance.")
+                  help="More = more robust but slower. 2000 is enough for "
+                       "typical microscope pairs; raise to 5000+ only if "
+                       "pairs fail to match.")
         st.slider("Lowe ratio threshold", 0.5, 0.9, 0.75, step=0.05,
                   key="ratio_thresh",
                   help="Lower = stricter match filtering. 0.75 is standard.")
@@ -844,50 +1468,54 @@ def render_sidebar() -> None:
         st.slider("CLAHE clip limit", 1.0, 8.0, 3.0, step=0.5, key="clahe_clip")
 
     with st.sidebar.expander("Blending", expanded=False):
-        st.slider("Laplacian pyramid levels", 2, 8, 5, step=1,
+        st.slider("Laplacian pyramid levels", 2, 8, 3, step=1,
                   key="blend_levels",
-                  help="More = smoother seams but slower.")
+                  help="More = smoother seams but slower. 3 is a good "
+                       "speed/quality balance for microscope rows; raise "
+                       "to 5 if seams are visible.")
         st.slider("Feather zone width (px)", 0, 200, 64, step=8,
                   key="blend_feather",
                   help="Smooth mask falloff toward tile edges.")
 
         # Unified weight-mode selector. Three mutually exclusive modes:
-        # - Feather:               stable default, works on dark images
+        # - Feather:               stable baseline, works on dark images
         # - Focus-weighted:         legacy per-tile sharpness weighting
-        # - Focus-priority (NEW):   cross-tile winner-takes-all at high
+        # - Focus-priority (DEFAULT): cross-tile winner-takes-all at high
         #                          frequencies — keeps the sharpest tile's
         #                          detail in the overlap zone
         st.radio(
             "Blending weight mode",
             options=[
-                "Feather (default)",
+                "Feather",
                 "Focus-weighted (per-tile)",
-                "Focus-priority (cross-tile)",
+                "Focus-priority (default)",
             ],
-            index=0,
+            index=2,
             key="blend_weight_mode",
             help=(
-                "Feather: smooth mask, robust on dark images. "
+                "Feather: smooth mask, robust on dark images; both tiles "
+                "contribute to the seam (averaged). "
                 "Focus-weighted: pixels in sharper zones of EACH tile get "
                 "higher weight (per-tile normalization, does not compare "
                 "across tiles). "
-                "Focus-priority: in the overlap zone, the tile with the "
-                "highest Tenengrad sharpness score wins the high-frequency "
-                "content (edges, fine detail); low frequencies are still "
-                "averaged so brightness stays smooth and residual alignment "
-                "errors are not revealed. Use this when the operator "
-                "focused each frame on a different depth and the goal is "
-                "to see the sharpest detail, not a pretty averaged picture."
+                "Focus-priority (DEFAULT): in the overlap zone, the tile "
+                "with the highest Tenengrad sharpness score wins the "
+                "high-frequency content (edges, fine detail); low "
+                "frequencies are still averaged so brightness stays smooth "
+                "and residual alignment errors are not revealed. Use this "
+                "when the operator focused each frame on a different depth "
+                "and the goal is to see the sharpest detail, not a pretty "
+                "averaged picture."
             ),
             horizontal=False,
         )
 
-        mode = st.session_state.get("blend_weight_mode", "Feather (default)")
+        mode = st.session_state.get("blend_weight_mode", "Focus-priority (default)")
         if mode == "Focus-weighted (per-tile)":
             st.slider("Gamma for focus weights", 0.5, 3.0, 1.5, step=0.1,
                       key="blend_gamma",
                       help=">1 — sharp zones dominate more within each tile.")
-        elif mode == "Focus-priority (cross-tile)":
+        elif mode == "Focus-priority (default)":
             st.slider(
                 "Focus-priority strength (gamma)", 2.0, 12.0, 6.0, step=0.5,
                 key="focus_priority_gamma",
@@ -1007,6 +1635,19 @@ def render_stitcher_tab():
                 st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
                          use_container_width=True)
 
+    # ROI preview (before the Stitch button) — visual feedback so the user
+    # can see WHICH band will be cropped before spending time on a stitch.
+    roi_enabled_preview = bool(_param("roi_enabled", True))
+    if roi_enabled_preview:
+        with st.expander("ROI band preview (applied before stitching)",
+                         expanded=True):
+            if _param("roi_mode", _ROI_MODE_REF1) == _ROI_MODE_PER_TILE:
+                _render_roi_preview_stitcher(
+                    tiles, float(_param("roi_height_fraction", 0.30)))
+            else:
+                _render_stitcher_roi_reference_ui(
+                    tiles, float(_param("roi_height_fraction", 0.30)))
+
     # Run button
     if not st.button("Stitch panorama", type="primary"):
         return
@@ -1020,9 +1661,12 @@ def render_stitcher_tab():
     # Run stitching (settings come from the shared sidebar via _param)
     try:
         eo = _param("expected_overlap", 0)
+        ems = _param("estimation_max_side", 1600)
+        roi_band, roi_bands_per_tile, roi_label, keep_full = \
+            _resolve_roi_band_for_stitcher(tiles)
         result = pipeline.stitch_row(
             tiles,
-            n_features=_param("n_features", 5000),
+            n_features=_param("n_features", 2000),
             ratio_thresh=_param("ratio_thresh", 0.75),
             ransac_thresh=_param("ransac_thresh", 5.0),
             use_clahe=_param("use_clahe", True),
@@ -1035,11 +1679,15 @@ def render_stitcher_tab():
             suppress_fixed_pattern=_param("suppress_fixed_pattern", True),
             enable_drift_guard=_param("enable_drift_guard", True),
             expected_overlap_pct=(eo if eo > 0 else None),
-            blend_levels=_param("blend_levels", 5),
+            estimation_max_side=(ems if isinstance(ems, int) else None),
+            blend_levels=_param("blend_levels", 3),
             blend_feather=_param("blend_feather", 64),
             blend_gamma=_param("blend_gamma", 1.5),
             blend_gain_strength=_param("gain_strength", 0.8),
             **_blend_mode_params(),
+            roi_band=roi_band,
+            roi_bands_per_tile=roi_bands_per_tile,
+            keep_full_panorama=keep_full,
             progress_callback=update_progress,
         )
     except Exception as e:
@@ -1114,7 +1762,7 @@ def render_pair_review_tab():
                            if eo > 0 else None)
             records = pair_review.estimate_pairs(
                 imgs, scale,
-                n_features=_param("n_features", 5000),
+                n_features=_param("n_features", 2000),
                 ratio_thresh=_param("ratio_thresh", 0.75),
                 ransac_thresh=_param("ransac_thresh", 5.0),
                 use_clahe=_param("use_clahe", True),
@@ -1203,14 +1851,20 @@ def render_pair_review_tab():
     h_full = int(tiles[0].image.shape[0])
 
     mode_label = st.radio(
-        "Overlay mode",
-        ["Blend", "Checkerboard", "Difference"],
+        "Preview mode",
+        ["Blend", "Checkerboard", "Difference", "Side-by-side (static)"],
         horizontal=True, key="rv_mode",
-        help="Blend: 50/50 mix in the overlap. Checkerboard: alternating "
-             "squares of both tiles — the classic alignment inspector. "
-             "Difference: |A-B| map, dark = perfectly aligned.")
+        help=("Blend: 50/50 mix in the overlap. Checkerboard: alternating "
+              "squares of both tiles — the classic alignment inspector. "
+              "Difference: |A-B| map, dark = perfectly aligned. "
+              "Side-by-side (static): both tiles shown in full next to "
+              "each other with seam markers — use when the overlay "
+              "hides a mismatch (one tile's content averages over the "
+              "other's, so a wrong dx/dy can look 'fine')."))
+    static_mode = mode_label == "Side-by-side (static)"
     mode = {"Blend": "blend", "Checkerboard": "checker",
-            "Difference": "difference"}[mode_label]
+            "Difference": "difference"}[mode_label if not static_mode
+                                         else "Blend"]
 
     # =================== Step 2 — review grid ===================
     st.subheader("Step 2 — Review every pair")
@@ -1229,7 +1883,7 @@ def render_pair_review_tab():
             help="Width of the black band inserted between the tiles of a "
                  "pair marked 'No overlap (black gap)'. Applied at the "
                  "moment the checkbox is ticked; the pair's dx can still be "
-                 "fine-tuned in Step 3 afterwards.")
+                 "fine-tuned in Step 4 afterwards.")
 
     st.caption(
         "Tick **Position is correct** under each pair that is properly aligned. "
@@ -1237,7 +1891,7 @@ def render_pair_review_tab():
         "automatic estimate is meaningless for them), tick **No overlap (black "
         "gap)** instead — the pair is placed side by side with a visible black "
         "band on the panorama. Unticked pairs are offered for manual adjustment "
-        "in Step 3.")
+        "in Step 4.")
 
     def _on_no_overlap(i_: int, rec_: dict) -> None:
         """on_change callback for the 'No overlap (black gap)' checkbox.
@@ -1272,9 +1926,16 @@ def render_pair_review_tab():
             dx_cur = float(rec.get("dx", rec.get("dx0", 0.0)))
             dy_cur = float(rec.get("dy", rec.get("dy0", 0.0)))
             no_ovl_i = bool(st.session_state.get(f"rvp_no_{i}", False))
-            prev = pair_review.render_pair_preview(
-                imgs[i], imgs[i + 1], dx_cur * scale, dy_cur * scale,
-                mode=mode, out_width=470)
+            if static_mode:
+                prev = pair_review.render_pair_preview_static(
+                    imgs[i], imgs[i + 1],
+                    dx_cur * scale, dy_cur * scale,
+                    out_width=470)
+            else:
+                prev = pair_review.render_pair_preview(
+                    imgs[i], imgs[i + 1],
+                    dx_cur * scale, dy_cur * scale,
+                    mode=mode, out_width=470)
             st.image(prev, use_container_width=True)
             st.markdown(f"**Pair {i+1} ↔ {i+2}** — `{tile_names[i]}` → "
                         f"`{tile_names[i+1]}`")
@@ -1299,12 +1960,143 @@ def render_pair_review_tab():
                      "width + gap, dy = 0). Unticking restores the previous "
                      "position.")
 
-    # =================== Step 3 — manual adjustment ===================
-    st.subheader("Step 3 — Manually adjust flagged pairs")
+    # =================== Step 3 — ROI band ===================
+    # Reference-tile workflow: the FIRST tile is shown with its auto-detected
+    # ROI band, the user tunes vertical offset / height sliders until the
+    # band brackets the disk cross-section the way they want, and then THE
+    # SAME band is applied to every tile in the row. Because the band is
+    # identical on every tile, Pair Review translations transfer exactly
+    # (no per-tile dy conversion), which keeps the seams sharp.
+    roi_enabled = bool(_param("roi_enabled", True))
+    if roi_enabled:
+        mode_roi = _param("roi_mode", _ROI_MODE_REF1)
+        h_frac = float(_param("roi_height_fraction", 0.30))
+        if mode_roi == _ROI_MODE_PER_TILE:
+            st.subheader("Step 3 — Region of interest")
+        else:
+            st.subheader("Step 3 — Region of interest (reference tile 1)")
+            st.caption(
+                "The FIRST tile is shown with its ROI band highlighted "
+                "(yellow rectangle). Tune the **Vertical offset** slider "
+                "until the band brackets the visible disk cross-section "
+                "the way you want \u2014 the SAME band is then applied to "
+                "every tile in the row (preview grid below). The band "
+                "HEIGHT is set by the sidebar **ROI height (fraction of "
+                "tile height)** slider. Because the band is identical on "
+                "every tile, Pair Review positions transfer exactly: no "
+                "vertical blur at the seams. The SAME offset slider is "
+                "available in the Stitcher tab ROI preview \u2014 the two "
+                "stay in sync.")
+
+        # Lazily compute + cache the reference band. The cache signature
+        # includes the sidebar ROI settings (mode / height) so a sidebar
+        # change recomputes the band IMMEDIATELY (no page reload needed)
+        # as well as the upload signature.
+        rv_state = st.session_state.get("review_state", {})
+        roi_sig = (sig, mode_roi, h_frac)
+        auto_bands_full = rv_state.get("roi_auto_bands_full")
+        auto_bands_sig = rv_state.get("roi_auto_bands_sig")
+        if auto_bands_full is None or auto_bands_sig != roi_sig:
+            if mode_roi == _ROI_MODE_PER_TILE:
+                ref_band_init = None
+                auto_bands_full = io_utils.roi_band_for_tiles(
+                    tiles, mode="auto", target_fraction=h_frac,
+                )
+            else:
+                # Auto (reference tile 1) — DEFAULT. The min/max bounds
+                # mirror roi_band_for_tiles so the sidebar fraction is
+                # honoured up to 1.0 of the tile height (not capped at
+                # 0.5 like the helper's defaults).
+                lo, hi = _auto_band_bounds(h_frac)
+                ref_band_init = io_utils.auto_detect_roi_band(
+                    tiles[0].image, target_fraction=h_frac,
+                    min_fraction=lo, max_fraction=hi)
+            if ref_band_init is not None:
+                auto_bands_full = [ref_band_init] * n
+            rv_state["roi_auto_bands_full"] = auto_bands_full
+            rv_state["roi_auto_bands_sig"] = roi_sig
+            st.session_state["review_state"] = rv_state
+
+        if mode_roi == _ROI_MODE_PER_TILE:
+            # ADVANCED per-tile path — kept for rows with heavy vertical
+            # drift between shots. The pipeline converts pair dy between
+            # the full-tile and cropped-tile frames automatically. The
+            # per-tile offset sliders share ONE state with the Stitcher
+            # tab's per-tile ROI preview (synchronised by on_change
+            # callbacks); the band height always comes from the sidebar
+            # "ROI height (fraction of tile height)" slider. The grid is
+            # rendered as a fragment: moving ONE tile's slider updates
+            # only this grid — and, thanks to the overlay cache,
+            # effectively only the edited tile's preview.
+            sig_hash_pt = _roi_sig_hash(sig) if sig is not None else "default"
+            st.caption(
+                "**Advanced per-tile mode.** Each tile gets its own "
+                "auto-detected band (height from the sidebar **ROI height "
+                "(fraction of tile height)** slider); use the per-tile "
+                "offset sliders below only if a band missed the disk on "
+                "that tile. The SAME sliders are available in the "
+                "Stitcher tab ROI preview and the two stay in sync. Pair "
+                "Review positions are converted automatically when the "
+                "per-tile bands differ.")
+            _render_pair_review_per_tile_grid(tiles, auto_bands_full,
+                                              sig_hash_pt)
+        else:
+            # REFERENCE TILE 1 path (default)
+            ref_band_auto = auto_bands_full[0]
+            h0 = int(tiles[0].image.shape[0])
+            # Interactive offset slider (px of tile 1). It shares ONE
+            # state with the offset slider in the Stitcher ROI preview
+            # (synchronised via on_change callbacks), so both tabs always
+            # show and stitch the SAME band. The band HEIGHT is governed
+            # by the sidebar "ROI height (fraction of tile height)"
+            # slider only — the old "Band height (px)" slider was removed
+            # (it duplicated the sidebar control).
+            sig_hash = _roi_sig_hash(sig) if sig is not None else "default"
+            shared_off = _roi_ref_off(sig_hash)
+            off_key = f"rvp_roi_ref_off_{sig_hash}"
+            ref_off = st.slider(
+                "Vertical offset of the band (px)", -h0 // 2, h0 // 2,
+                value=shared_off, step=5, key=off_key,
+                on_change=(lambda s=sig_hash, k=off_key:
+                           _roi_ref_off_cb(s, k)),
+                help=("Shift the reference band up (negative) or down "
+                      "(positive). Auto-detected position: "
+                      f"y=[{ref_band_auto[0]},{ref_band_auto[1]}). Band "
+                      "height: set by the sidebar ROI height (fraction) "
+                      "slider. Synchronised with the offset slider in "
+                      "the Stitcher ROI preview."))
+            ref_band = _shift_band(ref_band_auto, ref_off, h0)
+            auto_bands_full = [ref_band] * n
+
+            prev_ref = pair_review.render_tile_with_roi_overlay(
+                tiles[0].image, ref_band, out_width=520)
+            st.image(prev_ref, use_container_width=True)
+            st.caption(f"Reference band y=[{ref_band[0]},{ref_band[1]}) "
+                       f"({ref_band[1] - ref_band[0]} px of {h0} px "
+                       f"= {100.0 * (ref_band[1] - ref_band[0]) / h0:.0f}% "
+                       f"of the tile height, set by the sidebar ROI height "
+                       f"(fraction) slider). The same band is applied to "
+                       f"all {n} tiles.")
+            with st.expander(
+                    f"Preview: the same band applied to tiles 2..{n}",
+                    expanded=False):
+                n_cols_ref = min(4, max(2, n - 1))
+                ref_cols = st.columns(n_cols_ref)
+                for k, tile_k in enumerate(tiles[1:], start=1):
+                    with ref_cols[(k - 1) % n_cols_ref]:
+                        prev_k = pair_review.render_tile_with_roi_overlay(
+                            tile_k.image, ref_band, out_width=220)
+                        st.image(prev_k, use_container_width=True)
+                        st.caption(f"#{tile_k.index} {tile_k.name}")
+    else:
+        auto_bands_full = None
+
+    # =================== Step 4 — manual adjustment ===================
+    st.subheader("Step 4 — Manually adjust flagged pairs")
     unchecked = [i for i in range(n_pairs)
                  if not st.session_state.get(f"rvp_ok_{i}", False)]
     if not unchecked:
-        st.success("All pairs approved — continue to Step 4.")
+        st.success("All pairs approved — continue to Step 5.")
     else:
         st.caption(
             f"{len(unchecked)} pair(s) not approved yet. Nudge dx/dy below — "
@@ -1396,13 +2188,20 @@ def render_pair_review_tab():
                                "**Position is correct** for this pair in "
                                "Step 2 above.")
                 with lc:
-                    prev = pair_review.render_pair_preview(
-                        imgs[i], imgs[i + 1], dx * scale, dy * scale,
-                        mode=mode, out_width=760)
+                    if static_mode:
+                        prev = pair_review.render_pair_preview_static(
+                            imgs[i], imgs[i + 1],
+                            dx * scale, dy * scale,
+                            out_width=760)
+                    else:
+                        prev = pair_review.render_pair_preview(
+                            imgs[i], imgs[i + 1],
+                            dx * scale, dy * scale,
+                            mode=mode, out_width=760)
                     st.image(prev, use_container_width=True)
 
-    # =================== Step 4 — stitch ===================
-    st.subheader("Step 4 — Stitch the panorama with these positions")
+    # =================== Step 5 — stitch ===================
+    st.subheader("Step 5 — Stitch the panorama with these positions")
     st.caption(
         "The panorama is blended using exactly the positions shown above "
         "(converted back to full-resolution pixels). Blending options come "
@@ -1469,7 +2268,7 @@ def render_pair_review_tab():
                             continue
                         r = stitching.stitch_pair_sift(
                             tiles[i].image, tiles[i + 1].image,
-                            n_features=_param("n_features", 5000),
+                            n_features=_param("n_features", 2000),
                             ratio_thresh=_param("ratio_thresh", 0.75),
                             ransac_thresh=_param("ransac_thresh", 5.0),
                             use_clahe=_param("use_clahe", True),
@@ -1494,16 +2293,48 @@ def render_pair_review_tab():
         def stitch_cb(msg, p):
             progress.progress(min(max(p, 0.0), 1.0), msg)
 
+        # Resolve ROI for the Pair Review stitch. auto_bands_full holds the
+        # band for each tile. In the default reference-tile mode it already
+        # includes the user's offset (same band on every tile). In the
+        # advanced per-tile mode the shared per-tile offsets (the SAME
+        # state the previews use — Stitcher ROI preview + Pair Review
+        # Step 3) are applied here. When all tiles share the same band ->
+        # pass as a single `roi_band` (Pair Review translations transfer
+        # exactly). When the bands differ -> pass `roi_bands_per_tile`;
+        # pipeline.stitch_row converts pair dy between the full-tile and
+        # cropped-tile frames automatically.
+        roi_band_pr = None
+        roi_bands_per_tile_pr = None
+        keep_full_pr = False
+        if bool(_param("roi_enabled", True)) and auto_bands_full is not None:
+            keep_full_pr = bool(_param("keep_full_panorama", False))
+            if _param("roi_mode", _ROI_MODE_REF1) == _ROI_MODE_PER_TILE:
+                sig_hash_pr = (_roi_sig_hash(sig)
+                               if sig is not None else "default")
+                auto_bands_full = [
+                    _shift_band(auto_bands_full[k],
+                                _roi_pt_off(sig_hash_pr, k),
+                                int(tile_k.image.shape[0]))
+                    for k, tile_k in enumerate(tiles)
+                ]
+            if len(set(auto_bands_full)) == 1:
+                roi_band_pr = auto_bands_full[0]
+            else:
+                roi_bands_per_tile_pr = list(auto_bands_full)
+
         try:
             result = pipeline.stitch_row(
                 tiles,
-                blend_levels=_param("blend_levels", 5),
+                blend_levels=_param("blend_levels", 3),
                 blend_feather=_param("blend_feather", 64),
                 blend_gamma=_param("blend_gamma", 1.5),
                 blend_gain_strength=_param("gain_strength", 0.8),
                 **_blend_mode_params(),
                 pair_translations=final_translations,
                 pair_methods=methods,
+                roi_band=roi_band_pr,
+                roi_bands_per_tile=roi_bands_per_tile_pr,
+                keep_full_panorama=keep_full_pr,
                 progress_callback=stitch_cb,
             )
         except Exception as e:
