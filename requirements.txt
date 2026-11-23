@@ -40,5 +40,53 @@ plotly>=5.18
 # torchvision>=0.15
 # segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
 
-# === Click-on-image for app 02 (SAM click mode + Polygon click mode) ===
-streamlit-image-coordinates>=0.4.0
+# === Click-on-image for app 02 (SAM click mode + Polygon click mode)
+#     and the Cross-section Map tab of app 01 (tie points, scale-bar line) ===
+# 0.4.1 is the FIRST version whose FRONTEND implements width="stretch";
+# on 0.4.0 and older the app's width="stretch" is silently ignored and
+# the clickable previews render at natural size (900 px) — on a narrower
+# window the scale-bar tile under "Calibration mode" opens CUT OFF and
+# the scale bar is unreachable until the mode is switched back and forth.
+streamlit-image-coordinates>=0.4.1
+
+# === Scale-bar OCR for the Cross-section Map tab (app 01) ===================
+# OPTIONAL, but the "Read the value near the line (OCR)" button needs BOTH
+# parts below. Without the engine the button reports:
+#   "OCR failed: tesseract is not installed or it's not in your PATH."
+#
+# --- Part 1 · Python wrapper (installed by pip, this line) ------------------
+pytesseract>=0.3.10
+#
+# --- Part 2 · The Tesseract-OCR ENGINE (a separate program, NOT a pip
+#              package — pip alone can never fix the error above) -----------
+#
+# WINDOWS, step by step:
+#   1. Install the engine (pick ONE of these ways):
+#        winget install -e --id UB-Mannheim.TesseractOCR
+#      or download the 64-bit installer from
+#        https://github.com/UB-Mannheim/tesseract/wiki
+#        (file name: tesseract-ocr-w64-setup-5.3.x.x....exe)
+#      or, if you use Chocolatey:
+#        choco install tesseract
+#   2. Keep the DEFAULT install folder:
+#        C:\Program Files\Tesseract-OCR
+#      The application AUTO-DETECTS tesseract.exe there (and in
+#      C:\Program Files (x86)\Tesseract-OCR) even when the folder is NOT
+#      on your PATH — after installing, just restart the Streamlit app.
+#   3. (Optional) To make the engine visible to ALL programs, add the
+#      folder to PATH:
+#        Settings -> System -> About -> Advanced system settings ->
+#        Environment Variables -> Path -> New ->
+#        C:\Program Files\Tesseract-OCR -> OK,
+#      then close and reopen the terminal and start Streamlit again.
+#   4. Sanity check (cmd):
+#        "C:\Program Files\Tesseract-OCR\tesseract.exe" --version
+#      (must print e.g. "tesseract v5.3.x")
+#
+# LINUX:   sudo apt install tesseract-ocr
+# macOS:   brew install tesseract
+#
+# After (re)installing the engine, RESTART the Streamlit app — the OCR
+# availability check runs once at startup. If the button is still disabled,
+# the app will show the exact reason next to it (wrapper missing vs engine
+# missing vs engine found but broken).

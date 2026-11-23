@@ -426,73 +426,111 @@ def stitch_row(
 
     # With user-reviewed positions the chain is intentionally kept exactly
     # as reviewed — no automatic correction is applied.
+    # NOTE: the trend is computed over SUCCESSFUL pairs only. A failed pair
+    # carries a (0, 0) placeholder translation; feeding it into the trend
+    # both destroyed the trend fit (dxs > 50 fails -> guard disabled for
+    # the whole row) and poisoned the fit itself.
     if enable_drift_guard and n_pairs >= 4 and not use_overrides:
-        report("Checking vertical drift consistency...", 0.62)
-        dxs = np.array([d.translation[0] for d in pair_results], dtype=np.float64)
-        dys = np.array([d.translation[1] for d in pair_results], dtype=np.float64)
+        ok_idx = [i for i, d in enumerate(pair_results) if d.success]
+        if len(ok_idx) >= 4:
+            report("Checking vertical drift consistency...", 0.62)
+            dxs = np.array([pair_results[i].translation[0] for i in ok_idx],
+                           dtype=np.float64)
+            dys = np.array([pair_results[i].translation[1] for i in ok_idx],
+                           dtype=np.float64)
 
-        if (dxs > 50).all():  # row progresses to the right — trend is meaningful
-            trend = _robust_dy_trend(dxs, dys)
-            if trend is not None:
-                slope, intercept, inlier_mask = trend
-                drift_trend = (slope, intercept)
-                pred = slope * dxs + intercept
-                resid = dys - pred
-                mad = float(np.median(np.abs(
-                    resid[inlier_mask] - np.median(resid[inlier_mask]))))
-                sigma = 1.4826 * mad
-                thresh = max(35.0, 5.0 * sigma)
+            if (dxs > 50).all():  # row progresses to the right — trend is meaningful
+                trend = _robust_dy_trend(dxs, dys)
+                if trend is not None:
+                    slope, intercept, inlier_mask = trend
+                    drift_trend = (slope, intercept)
+                    pred = slope * dxs + intercept
+                    resid = dys - pred
+                    mad = float(np.median(np.abs(
+                        resid[inlier_mask] - np.median(resid[inlier_mask]))))
+                    sigma = 1.4826 * mad
+                    thresh = max(35.0, 5.0 * sigma)
 
-                for i in np.where(np.abs(resid) > thresh)[0]:
-                    i = int(i)
-                    d = pair_results[i]
-                    dy_pred = float(pred[i])
-                    old = d.translation
-                    corrected: Optional[Tuple[float, float]] = None
-                    source = ""
+                    for local_i in np.where(np.abs(resid) > thresh)[0]:
+                        local_i = int(local_i)
+                        i = ok_idx[local_i]          # index in pair_results
+                        d = pair_results[i]
+                        dy_pred = float(pred[local_i])
+                        old = d.translation
+                        corrected: Optional[Tuple[float, float]] = None
+                        source = ""
 
-                    # (a) trust the pair's own NCC evidence when it matches the trend
-                    if d.ncc_best is not None and abs(d.ncc_best[1] - dy_pred) <= 80.0 \
-                            and d.ncc_best_score >= max(d.score, d.ncc_best_score) - 0.05:
-                        if abs(d.ncc_best[0] - old[0]) > 3 or abs(d.ncc_best[1] - old[1]) > 3:
-                            corrected = d.ncc_best
-                            source = "NCC evidence"
-                    # (b) constrained NCC re-scan around the trend prediction
-                    elif d.ncc_best is not None:
-                        resc = stitching.stitch_pair_ncc(
-                            tiles[i].image, tiles[i + 1].image,
-                            dy_range=(int(dy_pred) - 70, int(dy_pred) + 70),
-                            use_clahe=use_clahe,
-                            clahe_clip=clahe_clip,
-                            tile_cache=tile_cache,
-                            n_features=n_features,
-                        )
-                        if resc.success and \
-                                resc.ncc_best_score >= max(d.ncc_best_score, d.score) - 0.10:
-                            corrected = resc.translation
-                            source = "constrained NCC re-scan"
+                        # (a) trust the pair's own NCC evidence when it matches the trend
+                        if d.ncc_best is not None and abs(d.ncc_best[1] - dy_pred) <= 80.0 \
+                                and d.ncc_best_score >= max(d.score, d.ncc_best_score) - 0.05:
+                            if abs(d.ncc_best[0] - old[0]) > 3 or abs(d.ncc_best[1] - old[1]) > 3:
+                                corrected = d.ncc_best
+                                source = "NCC evidence"
+                        # (b) constrained NCC re-scan around the trend prediction
+                        elif d.ncc_best is not None:
+                            resc = stitching.stitch_pair_ncc(
+                                tiles[i].image, tiles[i + 1].image,
+                                dy_range=(int(dy_pred) - 70, int(dy_pred) + 70),
+                                use_clahe=use_clahe,
+                                clahe_clip=clahe_clip,
+                                tile_cache=tile_cache,
+                                n_features=n_features,
+                            )
+                            if resc.success and \
+                                    resc.ncc_best_score >= max(d.ncc_best_score, d.score) - 0.10:
+                                corrected = resc.translation
+                                source = "constrained NCC re-scan"
 
-                    if corrected is not None:
-                        d.translation = corrected
-                        d.message += (f" | drift guard: dy corrected {old[1]:.1f} -> "
-                                      f"{corrected[1]:.1f} (deviated {resid[i]:.0f} px "
-                                      f"from trend dy~{dy_pred:.1f}; {source})")
-                        warnings.append(
-                            f"Pair {i+1}: dy corrected {old[1]:.1f} -> {corrected[1]:.1f} "
-                            f"px (was {resid[i]:+.0f} px off the vertical drift trend; "
-                            f"{source})")
-                    elif d.ncc_best is None:
-                        warnings.append(
-                            f"Pair {i+1}: dy={old[1]:.1f} deviates {resid[i]:+.0f} px from "
-                            f"the vertical drift trend (dy~{dy_pred:.1f}). Drift guard has "
-                            f"no NCC evidence for this pair (verification disabled?) — "
-                            f"kept as is.")
-                    else:
-                        warnings.append(
-                            f"Pair {i+1}: dy={old[1]:.1f} deviates {resid[i]:+.0f} px from "
-                            f"the vertical drift trend (dy~{dy_pred:.1f}). Kept as is — "
-                            f"NCC does not confirm the trend here. Check this pair "
-                            f"manually if the seam looks shifted.")
+                        if corrected is not None:
+                            d.translation = corrected
+                            d.message += (f" | drift guard: dy corrected {old[1]:.1f} -> "
+                                          f"{corrected[1]:.1f} (deviated {resid[local_i]:.0f} px "
+                                          f"from trend dy~{dy_pred:.1f}; {source})")
+                            warnings.append(
+                                f"Pair {i+1}: dy corrected {old[1]:.1f} -> {corrected[1]:.1f} "
+                                f"px (was {resid[local_i]:+.0f} px off the vertical drift trend; "
+                                f"{source})")
+                        elif d.ncc_best is None:
+                            warnings.append(
+                                f"Pair {i+1}: dy={old[1]:.1f} deviates {resid[local_i]:+.0f} px from "
+                                f"the vertical drift trend (dy~{dy_pred:.1f}). Drift guard has "
+                                f"no NCC evidence for this pair (verification disabled?) — "
+                                f"kept as is.")
+                        else:
+                            warnings.append(
+                                f"Pair {i+1}: dy={old[1]:.1f} deviates {resid[local_i]:+.0f} px from "
+                                f"the vertical drift trend (dy~{dy_pred:.1f}). Kept as is — "
+                                f"NCC does not confirm the trend here. Check this pair "
+                                f"manually if the seam looks shifted.")
+
+    # === Step 1c: failed-pair continuation ================================
+    # A pair whose estimation FAILED carries a (0, 0) placeholder. Chaining
+    # it verbatim placed the next tile EXACTLY ON TOP of the previous one
+    # (double-exposed "broken" content) and shrank the canvas — the main
+    # source of catastrophically corrupted 15+-tile panoramas. Instead the
+    # chain continues by the row prior: dx = median of the accepted dxs
+    # (falls back to one tile width), dy = the last accepted dy (drift is
+    # smooth). The pair is flagged in the warnings and MUST be reviewed in
+    # Pair Review.
+    if not use_overrides:
+        good = [d for d in pair_results if d.success]
+        if len(good) < len(pair_results):
+            med_dx = (float(np.median([d.translation[0] for d in good]))
+                      if good else float(tiles[0].image.shape[1]))
+            last_dy = (float(good[-1].translation[1]) if good else 0.0)
+            for d in pair_results:
+                if d.success:
+                    continue
+                d.translation = (med_dx, last_dy)
+                d.message += (" | FAILED pair — chain continued by the row "
+                              f"prior (dx={med_dx:.1f}, dy={last_dy:.1f}); "
+                              "REVIEW THIS PAIR in Pair Review")
+                warnings.append(
+                    f"Pair {d.pair_index + 1}: FAILED ({d.message.split(' | ')[0]}) "
+                    "— its position was CONTINUED by the row prior instead of "
+                    "stacking the tiles on top of each other. The seam at this "
+                    "pair is UNRELIABLE — verify it in Pair Review before "
+                    "trusting the panorama.")
 
     # === Step 2: cumulative absolute positions ===
     report("Computing absolute tile positions...", 0.65)
@@ -549,6 +587,7 @@ def stitch_row(
         )
         for k, (t, p) in enumerate(zip(tiles, abs_positions))
     ]
+    repair_stats: dict = {}
     panorama = blending.blend_tiles(
         placed,
         canvas_size=(canvas_h, canvas_w),
@@ -561,14 +600,27 @@ def stitch_row(
         focus_priority=blend_focus_priority,
         focus_priority_gamma=blend_focus_priority_gamma,
         focus_priority_levels=blend_focus_priority_levels,
+        repair_stats=repair_stats,
     )
+    if repair_stats.get("gap_px_filled"):
+        warnings.append(
+            f"Artifact repair: {repair_stats['gap_px_filled']} uncovered "
+            "seam-sliver pixel(s) between tiles were filled by interpolation "
+            "(thin black/grey streaks from integer position rounding).")
+    if repair_stats.get("outlier_px_repaired"):
+        warnings.append(
+            f"Artifact repair: {repair_stats['outlier_px_repaired']} isolated "
+            "broken pixel(s) inside the stitched area were replaced by their "
+            "3×3 median value.")
 
     report("Done!", 1.0)
 
     # Collect warnings
     for d in pair_results:
         if not d.success:
-            warnings.append(f"Pair {d.pair_index+1}: failed ({d.message})")
+            # Already reported (with the continuation explanation) by the
+            # failed-pair continuation block above — do not duplicate.
+            continue
         elif d.method == "ncc" and "rejected" not in d.message:
             warnings.append(f"Pair {d.pair_index+1}: SIFT failed, used NCC scan "
                             f"({d.message})")
@@ -706,10 +758,18 @@ def save_panorama(panorama: np.ndarray, out_path: Path, format: str = "auto") ->
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ext = out_path.suffix.lower().lstrip(".")
     if ext in ("tif", "tiff"):
-        # Save via tifffile for 16-bit and metadata
-        import tifffile
+        # Safe exporter (io_utils): LZW only when TWO independent codecs
+        # (tifffile + OpenCV/libtiff) verify the pixels; otherwise the
+        # panorama is written uncompressed — "broken pixels" in some
+        # viewers can no longer be produced by this path either.
         rgb = cv2.cvtColor(panorama, cv2.COLOR_BGR2RGB)
-        tifffile.imwrite(str(out_path), rgb, compression="lzw")
+        data = io_utils.encode_tiff_rgb(rgb, compress=True)
+        if data is None:
+            data = io_utils.encode_tiff_rgb(rgb, compress=False)
+        if data is None:
+            raise RuntimeError("TIFF encoding failed the pixel-exact "
+                               "verification — save as PNG instead.")
+        out_path.write_bytes(data)
     else:
         cv2.imwrite(str(out_path), panorama)
     return out_path

@@ -3,9 +3,17 @@ io_utils.py — Loading and sorting microscope images.
 
 Filename pattern: <prefix>_<N>.<ext>, where N is the sequential index in the panorama.
 Example: x10_1.tif, x10_2.tif, ..., x10_5.tif
+
+Also hosts the SAFE TIFF exporter used by every panorama download: a TIFF
+is accepted only when TWO INDEPENDENT codecs (tifffile and OpenCV's
+built-in libtiff) decode it back to the exact same pixels — the old
+single-codec self-check could pass a broken LZW file because the same
+encoder/decoder pair shared the same bug ("broken pixels" in other
+viewers while the self-check succeeded).
 """
 from __future__ import annotations
 
+import io as _io
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -334,3 +342,163 @@ def roi_band_for_tiles(
         y1 = max(y0 + 1, y1)
         out.append((y0, y1))
     return out
+
+
+# ---------------------------------------------------------------------------
+# SAFE TIFF export (used by every panorama download path)
+# ---------------------------------------------------------------------------
+
+def _tiff_decodes_identically(buf: bytes, ref_rgb: np.ndarray,
+                              require_pillow: bool = True) -> bool:
+    """True when INDEPENDENT TIFF codecs decode ``buf`` to exactly
+    ``ref_rgb``.
+
+    The previous check used tifffile only. tifffile also WRITES the file,
+    so a bug shared by the tifffile/imagecodecs encoder and decoder
+    verified fine there while libtiff-based programs (Windows Photos,
+    ImageJ, Photoshop, ...) showed shifted or garbled pixels. Requiring
+    second and third unrelated implementations to agree closes that hole:
+
+    1. tifffile (the encoder's own decoder — baseline);
+    2. OpenCV's bundled libtiff;
+    3. Pillow (``require_pillow=True``, used for COMPRESSED files): a
+       fully independent TIFF reader shipped with Streamlit. An
+       uncompressed attempt skips Pillow — uncompressed pixels cannot be
+       garbled by any codec, so a Pillow quirk must never block the last
+       fallback that guarantees a download.
+    """
+    try:
+        back = tifffile.imread(_io.BytesIO(buf))
+    except Exception:
+        return False
+    arr = np.asarray(back)
+    if not (arr.shape == ref_rgb.shape and arr.dtype == ref_rgb.dtype
+            and np.array_equal(arr, np.ascontiguousarray(ref_rgb))):
+        return False
+    try:
+        dec = cv2.imdecode(np.frombuffer(buf, dtype=np.uint8),
+                           cv2.IMREAD_COLOR)      # BGR uint8
+        if dec is None:
+            return False
+        ref_bgr = cv2.cvtColor(np.ascontiguousarray(ref_rgb),
+                               cv2.COLOR_RGB2BGR)
+        if not np.array_equal(dec, ref_bgr):
+            return False
+    except Exception:
+        return False
+    if require_pillow:
+        try:
+            from PIL import Image
+            with Image.open(_io.BytesIO(buf)) as im:
+                parr = np.asarray(im.convert("RGB"))
+            if not (parr.shape == ref_rgb.shape
+                    and np.array_equal(parr,
+                                       np.ascontiguousarray(ref_rgb))):
+                return False
+        except ImportError:
+            pass          # Pillow missing (never expected with Streamlit)
+        except Exception:
+            return False
+    return True
+
+
+def encode_tiff_rgb(image_rgb: np.ndarray,
+                    compress: Optional[bool] = True,
+                    extra_kwargs: Optional[dict] = None,
+                    classic: bool = True,
+                    info: Optional[dict] = None) -> Optional[bytes]:
+    """Encode an RGB uint8 image as a VERIFIED TIFF.
+
+    ``classic=True`` (DEFAULT) writes the file EXACTLY like the old
+    exporter that produced good TIFFs on the operator's workstation:
+    ``tifffile.imwrite(buf, rgb, compression="lzw")`` — no extra tags,
+    no special strip layout, no metadata of any kind. Every "fix" that
+    was layered on top of the plain writer (resolution/unit tags,
+    ImageJ ImageDescription, re-striped rowsperstrip layout) is a
+    deviation from that proven baseline and is only used when the
+    caller explicitly asks for it (``classic=False``).
+
+    ``compress=True``  — LZW; returned ONLY if independent decoders
+                         (tifffile + OpenCV/libtiff + Pillow) read the
+                         pixels back EXACTLY. Any doubt -> None (the
+                         caller falls back to uncompressed).
+    ``compress=False`` — uncompressed; verified by tifffile + OpenCV.
+    ``extra_kwargs``   — additional tifffile.imwrite arguments (calibration
+                         tags: resolution, resolutionunit, extratags...).
+                         IGNORED in classic mode (classic == plain file).
+    ``classic=False``  — write-time normalizations: ~256 KB strips
+                         (``rowsperstrip``) instead of tifffile's one
+                         giant strip, plus ``extra_kwargs`` is applied.
+                         Used for the optional "embed calibration
+                         metadata" export.
+    ``info``           — optional dict filled with diagnostics:
+                         ``compression_used`` ("lzw" / "none"),
+                         ``fell_back`` (bool), ``reason`` (str). When LZW
+                         is requested but unavailable (imagecodecs
+                         missing) or fails verification, the fallback to
+                         uncompressed is REPORTED instead of silently
+                         returning an unexpected file.
+
+    Returns bytes or None (when the encoding failed or failed verification).
+    """
+    img = np.ascontiguousarray(image_rgb)
+    if img.dtype != np.uint8:
+        # A float / 16-bit array would be written as a float / 16-bit TIFF
+        # that most viewers display as garbage ("broken pixels"). A float
+        # array in [0, 1] (common when a blending stage returns float)
+        # must be SCALED UP first — a plain clip+cast maps [0, 1] to
+        # {0, 1} and produces an all-black picture.
+        f = img.astype(np.float32)
+        if f.size and float(f.max()) <= 1.5:
+            f = f * 255.0
+        img = np.clip(f, 0, 255).astype(np.uint8)
+
+    def _finish(buf: bytes, comp: str) -> Optional[bytes]:
+        need_pillow = bool(comp == "lzw")
+        if buf and _tiff_decodes_identically(buf, img,
+                                             require_pillow=need_pillow):
+            if info is not None:
+                info["compression_used"] = comp
+                info.setdefault("fell_back", False)
+            return buf
+        if info is not None:
+            info["fell_back"] = True
+            info["reason"] = (f"{comp} file failed the pixel-exact "
+                              "decode verification")
+        return None
+
+    if classic:
+        out = _io.BytesIO()
+        try:
+            if compress:
+                tifffile.imwrite(out, img, compression="lzw", metadata=None)
+            else:
+                tifffile.imwrite(out, img, metadata=None)
+        except Exception as e:
+            # e.g. LZW without the imagecodecs package
+            if info is not None:
+                info["fell_back"] = True
+                info["reason"] = f"encoder unavailable: {e}"
+            if compress:
+                return None          # caller decides the fallback
+            return None
+        return _finish(out.getvalue(), "lzw" if compress else "none")
+
+    kw = dict(extra_kwargs or {})
+    # Canonical strip layout: ~256 KB per strip instead of one giant
+    # strip (tifffile default rowsperstrip=None). Some viewers cannot
+    # display single strips of tens/hundreds of megabytes and show the
+    # image black/grey; small strips are the most compatible layout.
+    _row_bytes = (img.shape[1] * img.shape[2]) if img.ndim == 3 \
+        else img.shape[1]
+    kw.setdefault("rowsperstrip", max(1, 262144 // max(1, _row_bytes)))
+    out = _io.BytesIO()
+    try:
+        if compress:
+            tifffile.imwrite(out, img, compression="lzw",
+                             metadata=None, **kw)
+        else:
+            tifffile.imwrite(out, img, metadata=None, **kw)
+    except Exception:
+        return None                      # codec missing / args rejected
+    return _finish(out.getvalue(), "lzw" if compress else "none")

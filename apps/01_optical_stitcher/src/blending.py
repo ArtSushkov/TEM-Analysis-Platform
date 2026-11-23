@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, replace
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -295,6 +295,43 @@ def _build_tile_pyramid_set(
     else:
         ten_pyr_2d = None
 
+    # === Canvas-border extension of the coarse levels ======================
+    # The canvas level sizes are CEILs ((h+1)//2 per level) while the tile
+    # pyramids are placed at FLOOR offsets with their own CEIL widths — for
+    # a tile that reaches the canvas right/bottom border the two disagree
+    # by 1 (sometimes 2) cells AT THE COARSEST LEVELS. Those cells get
+    # ZERO weight and zero content, and the Laplacian reconstruction
+    # (pyrUp) spreads the hole into a dark grey gradient ~10-20 px wide
+    # along the panorama border ("grey band" artifact). Fix: when the tile
+    # actually reaches the border, edge-replicate the last column/row of
+    # every level array so the floor-placed content exactly reaches the
+    # canvas border at ALL levels. Interior tiles are untouched.
+    reach_r = (x0 + img_compensated.shape[1]) >= canvas_w
+    reach_b = (y0 + img_compensated.shape[0]) >= canvas_h
+    if reach_r or reach_b:
+        def _pad_border(arr: np.ndarray, lvl: int) -> np.ndarray:
+            """Edge-replicate arr right/bottom up to the canvas level edge."""
+            cx0 = x0 // (2 ** lvl)
+            cy0 = y0 // (2 ** lvl)
+            h_l, w_l = _level_size(canvas_h, canvas_w, lvl)
+            need_w = w_l - cx0          # columns from the offset to the edge
+            need_h = h_l - cy0
+            pads = [
+                (0, max(0, need_h - arr.shape[0])) if reach_b else (0, 0),   # rows
+                (0, max(0, need_w - arr.shape[1])) if reach_r else (0, 0),   # cols
+            ]
+            if pads[0][1] or pads[1][1]:
+                extra = ((0, 0),) * (arr.ndim - 2)   # channel axis for 3D
+                return np.pad(arr, tuple(pads) + extra, mode="edge")
+            return arr
+
+        for lvl in range(levels + 1):
+            tile_lap_pyr[lvl] = _pad_border(tile_lap_pyr[lvl], lvl)
+            tile_weight_pyr_2d[lvl] = _pad_border(tile_weight_pyr_2d[lvl], lvl)
+        if ten_pyr_2d is not None:
+            for lvl in range(levels + 1):
+                ten_pyr_2d[lvl] = _pad_border(ten_pyr_2d[lvl], lvl)
+
     return _TilePyramidSet(
         k_tile=k_tile,
         x0=x0,
@@ -319,6 +356,7 @@ def blend_tiles(
     focus_priority: bool = False,
     focus_priority_gamma: float = 6.0,
     focus_priority_levels: int = 2,
+    repair_stats: Optional[dict] = None,
 ) -> np.ndarray:
     """Multi-band blending of tiles on the final canvas (memory-optimized).
 
@@ -364,6 +402,11 @@ def blend_tiles(
         chosen by focus, coarser bands are averaged. Increase to push the
         focus selection into coarser structure too (risk: reveals residual
         misalignment as visible steps).
+
+    repair_stats: optional dict — when supplied it is filled with the
+        post-blend artifact-repair counters ("gap_px_filled",
+        "outlier_px_repaired", "wide_gap_px_left") so the caller can
+        report what had to be fixed (see "broken and grey pixels" fix).
 
     Pixels not covered by any tile (zero coverage — e.g. the black gap of a
     "no overlap" pair or ragged canvas corners) are returned as pure black.
@@ -433,6 +476,27 @@ def blend_tiles(
         if pad_l or pad_r:
             images_blend[k] = np.pad(
                 images_blend[k], ((0, 0), (pad_l, pad_r), (0, 0)), mode="edge")
+
+    # === Step 0c: canvas-border sides keep FULL weight ======================
+    # The feather mask ramps the weight to 0 at tile edges. Where two tiles
+    # MEET that fade is the blend ramp — but on a side that lies ON the
+    # panorama border (no tile beyond it, e.g. the top/bottom edges of a
+    # thin strip panorama) the fade darkens REAL image content: after the
+    # weight normalization the outermost pixels of the panorama are
+    # attenuated and the border looks like a grey gradient band. Mark every
+    # canvas-border side "hard" (full weight up to the edge) — nothing has
+    # to be blended there.
+    for k, tile in enumerate(placed):
+        hl, hr, ht, hb = tile.hard_edges
+        x0 = tile.offset_x - gap_pads[k][0]
+        tw = compensated_uint8[k].shape[1]
+        th = compensated_uint8[k].shape[0]
+        hl = hl or (x0 <= 0)
+        hr = hr or (tile.offset_x + tw >= canvas_w)
+        ht = ht or (tile.offset_y <= 0)
+        hb = hb or (tile.offset_y + th >= canvas_h)
+        if (hl, hr, ht, hb) != tile.hard_edges:
+            placed[k] = replace(tile, hard_edges=(hl, hr, ht, hb))
 
     # === Step 1: Compute coverage (one canvas-sized array, uint8) ===
     # NOTE: computed from the ORIGINAL tile rectangles (tile.image), NOT the
@@ -565,4 +629,72 @@ def blend_tiles(
     # upsampling bleed into the black gap of "no overlap" pairs (and into
     # ragged canvas corners), so separator bands have crisp borders.
     final[~has_coverage] = 0
+
+    # === Step 6: artifact repair (fix of "broken and grey pixels") ========
+    # Two residual artifact classes survive the blend itself:
+    #   1. thin UNCOVERED slivers between adjacent tiles (integer rounding
+    #      of cumulative offsets, a pair placed 1-3 px short) — rendered
+    #      black/grey vertical streaks;
+    #   2. isolated broken pixels (uint8 clipping of float rounding at
+    #      pyramid seams).
+    # Both are repaired deterministically; the counters are reported to
+    # the caller (warnings in the UI), so nothing is hidden from the
+    # operator.
+    stats = _repair_panorama_artifacts(final, has_coverage)
+    if repair_stats is not None:
+        repair_stats.update(stats)
     return final
+
+
+def _repair_panorama_artifacts(final: np.ndarray,
+                               has_coverage: np.ndarray,
+                               max_gap_px: int = 32,
+                               outlier_thresh: int = 60) -> dict:
+    """Repair residual blending artifacts IN PLACE; return counters.
+
+    1. Narrow uncovered runs (<= ``max_gap_px`` wide) that have covered
+       pixels on BOTH sides in the same row are filled with a horizontal
+       linear interpolation between those neighbours — the classic 1-3 px
+       seam slivers from integer position rounding disappear; wider runs
+       (real no-overlap gaps, ragged corners) are left untouched.
+    2. Isolated outlier pixels inside the covered area (value deviating
+       from the 3x3 median by more than ``outlier_thresh`` in ANY channel)
+       are replaced by that median — salt/pepper-style specks from the
+       pyramid reconstruction vanish; real texture (grain boundaries,
+       dust) is untouched because it is never an isolated 1-px spike.
+    """
+    H, W = has_coverage.shape[:2]
+    filled = 0
+    nc = ~has_coverage
+    if nc.any():
+        int8v = nc.astype(np.int8)
+        d = np.diff(np.concatenate([np.zeros((H, 1), np.int8), int8v,
+                                    np.zeros((H, 1), np.int8)], axis=1))
+        for r in range(H):
+            row = int8v[r]
+            if not row.any():
+                continue
+            starts = np.where(d[r] == 1)[0]
+            ends = np.where(d[r] == -1)[0]
+            for s, e in zip(starts, ends):
+                if s <= 0 or e >= W:          # touches the row border
+                    continue
+                if e - s > max_gap_px:        # a real gap, not a sliver
+                    continue
+                left = final[r, s - 1].astype(np.float32)
+                right = final[r, e].astype(np.float32)
+                n = e - s
+                t = (np.arange(1, n + 1, dtype=np.float32) / (n + 1))
+                final[r, s:e] = (
+                    left[None, :] * (1.0 - t[:, None])
+                    + right[None, :] * t[:, None]).astype(np.uint8)
+                filled += int(n)
+    repaired = 0
+    if has_coverage.any() and outlier_thresh > 0:
+        med = cv2.medianBlur(final, 3)
+        diff = np.abs(final.astype(np.int16) - med.astype(np.int16)).max(axis=2)
+        bad = (diff > outlier_thresh) & has_coverage
+        repaired = int(bad.sum())
+        if repaired:
+            final[bad] = med[bad]
+    return {"gap_px_filled": filled, "outlier_px_repaired": repaired}

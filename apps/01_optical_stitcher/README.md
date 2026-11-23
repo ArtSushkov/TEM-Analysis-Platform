@@ -17,6 +17,12 @@ Preparing cross-sections for TEM often requires inspecting the disk surface on a
   ~4x speedup and ~4x smaller panorama on 20 MP frames. Per-tile offset
   correction in Pair Review when the operator shifted the disk vertically.
 - **Pair Review tab** — verify every pair visually and adjust positions by hand
+- **Cross-section Map tab** — register the stitched x10 overview panorama
+  with the stitched x100 cross-section panorama of the SAME TEM disk:
+  automatic scale-bar calibration (detection + OCR, manually correctable),
+  tie-point registration on the disk edges, calibration consistency check,
+  click-to-crop preview (200 µm field of view + uncertainty margin) and a
+  standalone interactive HTML report
 - **No-overlap pairs** — mark accidentally non-overlapping shots with a checkbox;
   they are placed side by side with a visible black gap on the panorama
 - **Static side-by-side pair preview** — overlay views can hide a wrong dx/dy
@@ -75,9 +81,11 @@ Supported formats: `.tif`, `.tiff` (including LZW), `.png`, `.jpg`, `.jpeg`, `.b
 
 ### 2. Scale Bar (Important!)
 
-TIFF files from microscope cameras typically do **not** store scale information in metadata.
-To preserve the scale bar in the final panorama, embed it visually into one of the images
-via the microscope software:
+TIFF files from microscope cameras typically do **not** store scale information in metadata,
+but some software (ImageJ, OME-TIFF writers, FEI/SEM capture tools) does. The calibration
+block at the top of the **Stitcher** and **Pair Review** tabs handles both cases — and if
+the metadata is missing (or you decline it), you can still calibrate from the visible scale
+bar embedded in one of the tiles:
 
 - **First image of the series**: place the scale bar in the **bottom-left corner**.
   This part of the first tile is never overlapped by the second tile, so the scale bar
@@ -162,6 +170,94 @@ a precise `Expected overlap` prior:
 Positions, approvals and no-overlap marks can be exported/imported as JSON, so a
 review session survives browser refreshes.
 
+### 5b. Calibration (µm per pixel) — top of the Stitcher / Pair Review tabs
+
+The calibration block is the FIRST thing you see in the **Stitcher** and
+**Pair Review** tabs after uploading a series. The same flow runs in both
+tabs and the calibration is keyed by the upload — calibrate once per
+series and it sticks (the calibration is attached automatically to the
+saved panorama when you press **Save to Cross-section Map**).
+
+**Step 1 — Auto-search in image metadata.** Every tile of the series is
+scanned for pixel-size metadata. Sources checked (in this order):
+
+- **TIFF XResolution / YResolution + ResolutionUnit** — the standard
+  TIFF resolution tags (inch / centimeter). Returns µm/px.
+- **ImageDescription (ImageJ)** — ImageJ writes `unit=micron` /
+  `pixel_width=...` / `pixel_height=...` into the TIFF
+  ImageDescription tag.
+- **ImageDescription (OME-XML)** — OME-TIFF writers embed
+  `PhysicalSizeX="..."` / `PhysicalSizeY="..."` (default unit µm).
+- **Vendor TIFF tags (FEI / SEM XML)** — best-effort extraction of
+  `<PixelSizeX>` / `<pixel_width>` from FEI/SEM XML metadata.
+
+The found values are shown per tile; a consistent value across all tiles
+with metadata is highlighted as the suggested calibration. Disagreements
+between tiles fall back to the median with a warning.
+
+**Step 2 — Action.** Pick one of:
+
+1. **Accept metadata calibration** — apply the suggested µm/px value
+   (only available when metadata was found).
+2. **Decline — calibrate manually from a scale bar** — always
+   available, whether metadata was found or not.
+
+**Step 3 — Manual flow (after Decline).** Pick the tile of the series
+where the scale bar is visible (the bar is common to the whole series),
+choose the **Snapshot display size** (640 / 800 / 960 / 1120 / 1280 px,
+default 960 — the operator's request: a BIGGER snapshot so the cursor can
+land ON a scale-bar pixel; the choice is remembered for the session, the
+full snapshot is never cropped at any width), then one of TWO modes (the
+two auto-search modes "1 · Auto search the entire selected tile" and
+"2 · Draw ROI on the tile, then auto search within it" were REMOVED at
+the operator's request — the click-based modes proved faster and more
+reliable; at the operator's request the two click-based modes were
+RENUMBERED 1 / 2, and mode 1 is the FIRST option and therefore the
+DEFAULT):
+
+1. **Click once ON the bar — the app traces its full length (mode 1,
+   default, universal fallback)** — click ANY pixel that belongs to the bar,
+   whatever its colour (red, blue, white, black — any microscope or
+   operator colour scheme; no neural network is trained, so nothing
+   breaks when the next microscope draws the bar in a different
+   colour). The app takes the colour of the clicked pixel (3x3 median)
+   and grows the trace left/right along the clicked row by colour
+   similarity, following slightly tilted bars across adjacent rows,
+   extending through anti-aliased tips, and rejecting traces that do
+   not stand out against the surrounding background (so a click on a
+   flat background can never produce an image-wide "bar"). The traced
+   line with its endpoints is drawn on the preview AND, immediately
+   after the click, a **ZOOMED verification view** of the found bar is
+   shown — an enlarged fragment with the red traced line and the green
+   endpoints on it, with enough room above and below to read the label
+   — so the operator can confirm at magnification that the trace is
+   correct before applying anything. A **colour tolerance** slider
+   handles noisy JPEG artefacts. The value is then read by OCR (tall
+   label windows ABOVE **and** BELOW the bar are both tried; the
+   window that produced the reading is reported) or typed in and
+   applied explicitly. This is the recommended mode when the bar is
+   thin and precise end-to-end clicking (mode 2) is fiddly.
+2. **Draw ROI on the tile, then click two ends of the bar** — draw the
+   ROI with two clicks (click 1 = upper-left corner, click 2 =
+   lower-right corner; a 3rd click starts a new rectangle), then click
+   the two extreme points of the scale bar inside the ROI preview to
+   build a red line. A scale bar is a strictly horizontal line, so
+   while **Force horizontal line** is ON (default) the second y is
+   kept EXACTLY equal to the first one: the clicked y of point 2 is
+   replaced by the y of point 1, the length is |x2 − x1| and the y2
+   field is locked. The line is drawn ON the clickable preview and
+   updates LIVE: every change of the end-1/end-2 coordinates (a new
+   click or a typed value) is re-drawn on the image immediately.
+   Enter the bar's real length in µm / nm / mm; the pixel length is
+   measured in full-res coordinates. Click coordinates fill the
+   numeric fields ONCE (at the moment of the click) and never
+   overwrite values you typed by hand. Always works and is the most
+   accurate mode (the OCR mode needs pytesseract + the tesseract
+   binary).
+
+The resulting calibration is shown as `X.XXXX µm/px (source · extra)`,
+where source is `metadata`, `auto (OCR)` or `manual`.
+
 ### 6. Run
 
 Click **Stitch panorama** (Stitcher tab) or **Stitch panorama with these positions**
@@ -169,12 +265,134 @@ Click **Stitch panorama** (Stitcher tab) or **Stitch panorama with these positio
 
 ### 7. Result
 
+The result block is PERSISTED in the session: it stays visible after any
+click, so you can download the panorama, download its calibration sidecar,
+copy the positions CSV and save to the Cross-section Map — in any order,
+repeatedly. Previously the whole block vanished after the first
+download/save click. **Hide result (clear downloads)** removes it from the
+session (a new upload also clears it automatically).
+
 - Preview of the stitched panorama
 - Diagnostics table for each pair (method, dx/dy, rotation, matches, inliers)
 - Tile position map (absolute coordinates on the canvas)
-- Download buttons:
-  - **Panorama** in the chosen format (PNG / TIFF / JPEG)
+- Download buttons (each label shows the resulting file size in MB, so
+  an interrupted download is spotted instantly):
+  - **Panorama** in the chosen format — **PNG is the DEFAULT** (JPEG is
+    also available). The TIFF export was REMOVED at the operator's
+    request: the x100 panorama in TIFF repeatedly opened black-grey or
+    with grey "broken" pixels in third-party viewers, no matter which
+    exporter variant or metadata layout was used, while PNG stores
+    exactly the same pixels losslessly with no codec layer that any
+    viewer could reinterpret. The panorama bytes are cached per format
+    and calibration, so repeated downloads do not re-encode the image.
+  - **PNG / JPEG** cannot store a reliable µm/px value (the PNG `pHYs`
+    chunk holds only INTEGER pixels-per-metre and most viewers ignore
+    it) — an additional **Download calibration (.txt)** button offers a
+    plain-text sidecar (`um_per_pixel`, `px_per_um`, `method`, the bar
+    line and value, OCR text) to keep next to the image.
   - **CSV** with all tile positions
+  - **Save to Cross-section Map** — keeps the stitched panorama (+ its
+    first tile) in the session memory for the Cross-section Map tab,
+    TOGETHER WITH the calibration produced at the top of the tab (the
+    caption above the button shows what will be attached). Do this once
+    for the x10 series and once for the x100 series — the registration
+    of the two panoramas needs BOTH calibrations. The saved entry keeps
+    its calibration across reruns, so downloading a file and saving to
+    the map can be combined freely.
+
+The generated panorama bytes are cached in the session (keyed by format
+and calibration), so repeated downloads do not re-encode the image every
+click.
+
+### 8. Cross-section Map (x10 → x100 registration + HTML report)
+
+The third navigation tab connects the two panoramas of ONE TEM disk: the x10
+overview (whole disk, shot slightly tilted through the sacrificial glass) and
+the x100 detail (top view of the IC cross-section). Workflow:
+
+1. **Panorama sources** — pick the x10 and x100 panoramas from the in-session
+   store (what you saved with **Save to Cross-section Map** in the Stitcher /
+   Pair Review tabs) or load panorama image files directly. Overview and
+   Detail are PRE-SELECTED automatically by resolution every time the store
+   changes (Overview = the smallest-resolution panorama, Detail = the
+   largest one) — the manual selection is still available and is kept while
+   the store stays unchanged.
+2. **Calibrations (from Stitcher / Pair Review)** — both panoramas arrive
+   already calibrated (the calibration produced at the top of the Stitcher
+   / Pair Review tabs is attached to the saved entry). This section is
+   READ-ONLY: it only shows the two calibrations. There is deliberately NO
+   calibration UI here any more — calibrate at the top of the Stitcher /
+   Pair Review tabs and press **Save to Cross-section Map** again. If a
+   panorama is not calibrated, the section says so and points to those
+   tabs (sections 3–5 need BOTH calibrations).
+3. **Tie points (disk edges)** — pick the SAME physical point on both
+   panoramas (the disk edges are visible in both): 2 points give an exact
+   similarity mapping (scale + rotation + translation), 3–6 points give a real
+   error estimate from the residuals. The two previews are STACKED one under
+   another (each spans the full page width). Picking is TWO-STEP (the
+   operator's request for pixel-precise agreement between the x10 and x100
+   points): the FIRST click on a preview does NOT fix the pixel — it opens a
+   MAGNIFIED fragment (220 px window of the full-resolution panorama,
+   enlarged x6, red crosshair + orange box at the first click); the SECOND
+   click INSIDE the magnified fragment fixes the exact point and prefills
+   the coordinate fields. "Cancel magnifier" closes it without fixing
+   anything. From 3 tie points an optional **Affine** mapping model becomes
+   available — it adds anisotropic scale + shear and absorbs the tilt
+   distortion of the x10 view (part of the large mid-panorama errors).
+4. **Consistency check** — the physical distance between every pair of tie
+   points is computed on BOTH panoramas via their calibrations; the distances
+   must match (same disk!). A deviation above 5 % means one of the
+   calibrations is wrong.
+5. **Live preview** — click any pixel of the x10 panorama: the mapped point
+   (with its uncertainty radius) is drawn on x10 and the corresponding crop is
+   taken from the x100 panorama — 200 µm field of view (configurable) plus a
+   safety margin k·σ. The crosshair always marks the CURRENT point (the
+   preview is rebuilt right after every click). The x100 fragment carries a
+   labelled SCALE BAR in its bottom-left corner (the largest round
+   1/2/5/10... µm value that fits) and **GLASS / IC side plates** centred
+   on its TOP / BOTTOM edges — a radio above the preview asks which side
+   of the x100
+   panorama is the sacrificial glass (the other side is the IC); the
+   same plates appear on every fragment in the HTML report. Points mapped
+   outside the
+   x100 coverage are clamped to the nearest area with an explicit warning.
+   The preview also reports the distance to the nearest tie point — between
+   tie points the mapping is an interpolation and beyond them an
+   extrapolation, so the true local error (glass parallax, stitching drift
+   of the two independently stitched panoramas) can be much larger than σ.
+   All clickable previews (tie points, live preview, ROI pickers) now
+   STRETCH to the container width, so a wide panorama is fully visible and
+   every point of it is clickable — clicks are rescaled from the displayed
+   size back to the full-resolution coordinates automatically.
+6. **HTML report** — one standalone offline file with the same interactive
+   click-to-crop behaviour (pure inline JS) and the registration metadata
+   (calibrations, tie points, residuals, consistency, glass/IC side
+   labels). Layout: the x10
+   panorama spans the FULL page width; the x100 fragment is placed BELOW
+   it and shows EXACTLY the field of view from the app ("Field of view
+   around the point (µm)" plus the k·σ margin) — a bigger FOV shows more
+   of the panorama, a smaller one zooms in. The fragment ALWAYS fits the
+   page width: a window wider than the page is scaled down to it (the
+   whole picture stays visible and readable), a smaller window is shown
+   1:1. The fragment carries the same labelled scale
+   bar in its bottom-left corner and the same **GLASS / IC plates
+   centred on its top / bottom edges** (they travel with the fragment when it is moved
+   along the disk-edge line; the side assignment is also written into
+   the registration metadata section). Every click also reports the distance
+   to the nearest tie point (interpolation/extrapolation warning). The
+   two download buttons give
+   FULL-resolution JPEG copies (quality 95) embedded separately from the
+   compact interactive images (this can be switched off with the
+   'Embed full-resolution copies' checkbox). Full-resolution PNG downloads
+   are in the same tab. The generated report is kept in the session, so
+   the download button stays available after clicks (**Discard generated
+   report** removes it).
+
+The mapping is deliberately approximate; with ≥ 3 tie points the optional
+Affine model absorbs the anisotropic part (tilt), but glass parallax and
+the stitching drift between the two independently stitched panoramas stay
+unmodelled — the uncertainty estimate, the crop margin and the
+nearest-tie-point warning make the residual error visible instead.
 
 ## How It Works
 
@@ -223,7 +441,8 @@ Click **Stitch panorama** (Stitcher tab) or **Stitch panorama with these positio
 
 ```
 01_optical_stitcher/
-├── app.py                  # Streamlit UI (Stitcher / Pair Review / Help tabs)
+├── app.py                  # Streamlit UI (Stitcher / Pair Review /
+│                           #   Cross-section Map / Help tabs)
 ├── README.md
 └── src/
     ├── __init__.py
@@ -233,7 +452,13 @@ Click **Stitch panorama** (Stitcher tab) or **Stitch panorama with these positio
     ├── pair_review.py      # Review-scale estimation + overlay/static previews
     │                       #   + ROI overlay rendering + JSON session
     ├── blending.py         # Multi-band blending (memory-optimized, focus-priority)
-    └── pipeline.py         # Orchestration (+ reviewed-position overrides + ROI)
+    ├── pipeline.py         # Orchestration (+ reviewed-position overrides + ROI)
+    └── cross_section_map.py  # x10/x100 registration + HTML report
+                              #   + calibration flow (metadata auto-search,
+                              #     manual auto/ROI-auto/ROI-manual-two-clicks)
+                              #   used at the TOP of the Stitcher / Pair Review
+                              #   tabs and as an on-demand fallback in the
+                              #   Cross-section Map tab
 ```
 
 ## Troubleshooting

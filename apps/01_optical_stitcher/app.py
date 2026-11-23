@@ -22,7 +22,7 @@ import streamlit as st
 # Add path to src
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src import io_utils, pipeline, pair_review, preprocessing, stitching
+from src import cross_section_map, io_utils, pipeline, pair_review, preprocessing, stitching
 
 
 # === Page configuration ===
@@ -75,7 +75,7 @@ st.markdown(
 # sidebar"), and Streamlit deleted the uploaded-file session state because
 # the uploader widgets stopped rendering. The always-on sidebar fixes both.
 
-NAV_TABS = ["Stitcher", "Pair Review", "Help"]
+NAV_TABS = ["Stitcher", "Pair Review", "Cross-section Map", "Help"]
 
 
 def _render_navigation() -> str:
@@ -600,44 +600,129 @@ def _wipe_pair_widgets():
             del st.session_state[k]
 
 
-def render_stitch_result(result, tiles):
-    """Render panorama result: diagnostics, warnings, preview, downloads."""
-    st.success(f"Panorama assembled: {result.canvas_size[1]}x{result.canvas_size[0]} px")
+_RESULT_SNAP_STITCHER = "stitch_result_snap_stitcher"
+_RESULT_SNAP_PAIR = "stitch_result_snap_pair"
+
+
+def _result_snapshot(result, tiles, source):
+    """Serializable snapshot of a StitchResult, persisted in session_state.
+
+    The result block (preview + all download/save buttons) is rendered
+    from this snapshot on EVERY rerun while it exists. Before this change
+    the block existed only inside the single run that pressed the stitch
+    button, so the FIRST click on any download/save button reran the
+    script, the button state was lost and the whole block vanished.
+    """
+    return {
+        "panorama_bgr": result.panorama,
+        "panorama_full": getattr(result, "panorama_full", None),
+        "canvas_size": tuple(result.canvas_size),
+        "tile_positions": [tuple(p) for p in result.tile_positions],
+        "diagnostics": [{
+            "pair_index": int(d.pair_index),
+            "method": d.method,
+            "success": bool(d.success),
+            "tx": float(d.translation[0]),
+            "ty": float(d.translation[1]),
+            "rotation_deg": float(d.rotation_deg),
+            "scale": float(d.scale),
+            "matches": int(d.matches),
+            "inliers": int(d.inliers),
+            "score": float(d.score),
+            "message": d.message,
+        } for d in result.diagnostics],
+        "warnings": list(result.warnings),
+        "drift_trend": (tuple(result.drift_trend)
+                        if result.drift_trend else None),
+        "tiles": [{"name": t.name, "index": int(t.index),
+                   "w": int(t.image.shape[1]), "h": int(t.image.shape[0])}
+                  for t in tiles],
+        "first_tile_bgr": (tiles[0].image if tiles else None),
+        "source": source,
+        "upload_sig": _current_upload_signature(),
+    }
+
+
+def _snap_download_bytes(snap, img_bgr, rgb, upload_calib, ext, enc_prefix) \
+        -> Tuple[bytes, dict]:
+    """Encode a panorama for download, cached INSIDE the snapshot.
+
+    Encoding a multi-megapixel PNG/JPEG on every rerun made each
+    interaction with the tab visibly slower once the result block
+    persisted; the cache is keyed by the format AND the calibration
+    (recalibrating invalidates the cached download automatically).
+    Returns ``(bytes, info)`` where ``info`` carries encode diagnostics
+    (kept for compatibility; PNG/JPEG have none). The TIFF export was
+    removed at the operator's request — PNG is the lossless export.
+    """
+    enc = snap.setdefault("enc_cache", {})
+    infos = snap.setdefault("enc_info", {})
+    px_tag = (float(upload_calib.px_per_um)
+              if (upload_calib is not None and upload_calib.ok) else 0.0)
+    ck = f"{enc_prefix}:{ext}:{px_tag:.10g}"
+    if ck not in enc:
+        if ext == "png":
+            ok, buf = cv2.imencode(".png", img_bgr)
+            enc[ck] = buf.tobytes() if ok else b""
+        else:
+            ok, buf = cv2.imencode(".jpg", img_bgr,
+                                   [cv2.IMWRITE_JPEG_QUALITY, 95])
+            enc[ck] = buf.tobytes() if ok else b""
+        infos[ck] = {}
+    return enc[ck], infos.get(ck, {})
+
+
+def render_stitch_result(snap, snap_key=None):
+    """Render a PERSISTED panorama-result snapshot: diagnostics, warnings,
+    preview, download + save buttons.
+
+    The snapshot (see ``_result_snapshot``) lives in session_state and is
+    therefore rendered on every rerun while it exists — clicking a
+    download button or 'Save to Cross-section Map' no longer makes the
+    block disappear, and all the other download/save options stay
+    available afterwards. ``snap_key`` adds a 'Hide result' button that
+    removes the snapshot from the session.
+    """
+    source = snap.get("source", "Stitcher")
+    tiles_meta = snap.get("tiles") or []
+    cw, ch = snap.get("canvas_size", (0, 0))
+    st.success(f"Panorama assembled: {ch}x{cw} px")
 
     # Pairwise diagnostics
     st.subheader("Stitching Diagnostics")
     diag_data = []
-    for d in result.diagnostics:
+    for d in snap.get("diagnostics", []):
         diag_data.append({
-            "Pair": f"{d.pair_index+1} <-> {d.pair_index+2}",
-            "Method": d.method,
-            "Success": "yes" if d.success else "no",
-            "dx": f"{d.translation[0]:.1f}",
-            "dy": f"{d.translation[1]:.1f}",
-            "rot_deg": f"{d.rotation_deg:.3f}",
-            "scale": f"{d.scale:.4f}",
-            "matches": d.matches,
-            "inliers": d.inliers,
-            "ncc": f"{d.score:.3f}" if d.score > 0 else "-",
-            "Note": d.message,
+            "Pair": f"{d['pair_index']+1} <-> {d['pair_index']+2}",
+            "Method": d["method"],
+            "Success": "yes" if d["success"] else "no",
+            "dx": f"{d['tx']:.1f}",
+            "dy": f"{d['ty']:.1f}",
+            "rot_deg": f"{d['rotation_deg']:.3f}",
+            "scale": f"{d['scale']:.4f}",
+            "matches": d["matches"],
+            "inliers": d["inliers"],
+            "ncc": f"{d['score']:.3f}" if d["score"] > 0 else "-",
+            "Note": d["message"],
         })
     st.dataframe(diag_data, use_container_width=True)
-    if result.drift_trend is not None:
-        slope, intercept = result.drift_trend
+    drift = snap.get("drift_trend")
+    if drift:
+        slope, intercept = drift
         st.caption(
             f"Vertical drift trend: {slope*1000:+.1f} px per 1000 px of horizontal "
             f"travel (intercept {intercept:+.1f} px). A smooth trend is normal — "
             "microscope stages drift vertically while moving along the row. "
             "Single pairs jumping off the trend are flagged in the warnings below.")
 
-    if result.warnings:
+    if snap.get("warnings"):
         st.warning("Warnings:")
-        for w in result.warnings:
+        for w in snap["warnings"]:
             st.write(f"- {w}")
 
     # Panorama preview
     st.subheader("Result")
-    panorama_rgb = cv2.cvtColor(result.panorama, cv2.COLOR_BGR2RGB)
+    panorama_rgb = cv2.cvtColor(snap["panorama_bgr"], cv2.COLOR_BGR2RGB)
     h, w = panorama_rgb.shape[:2]
     if max(h, w) > 4000:
         st.info(f"Large image ({w}x{h}), showing downscaled preview. "
@@ -648,16 +733,22 @@ def render_stitch_result(result, tiles):
         preview = panorama_rgb
     st.image(preview, use_container_width=True)
 
+    # Operator tools available with EVERY stitching method (Stitcher and
+    # Pair Review): the disk-distance check of calibration + stitch, and
+    # the manual broken-pixel scan / repair of the finished panorama.
+    cross_section_map.render_disk_distance_check(snap, snap_key=snap_key or "res")
+    cross_section_map.render_broken_pixel_repair(snap, snap_key=snap_key or "res")
+
     # Tile positions
     st.subheader("Tile Position Map")
     try:
         import plotly.graph_objects as go
         fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=[p[0] for p in result.tile_positions],
-            y=[p[1] for p in result.tile_positions],
+            x=[p[0] for p in snap["tile_positions"]],
+            y=[p[1] for p in snap["tile_positions"]],
             mode="lines+markers+text",
-            text=[t.name for t in tiles],
+            text=[t["name"] for t in tiles_meta],
             textposition="top center",
             line=dict(color="#1f77b4", width=2),
             marker=dict(size=8),
@@ -675,69 +766,84 @@ def render_stitch_result(result, tiles):
     except Exception:
         pass  # plotly not available — text output below still works
     positions_text = "\n".join(
-        f"  {t.name}: ({pos[0]}, {pos[1]})"
-        for t, pos in zip(tiles, result.tile_positions)
+        f"  {t['name']}: ({pos[0]}, {pos[1]})"
+        for t, pos in zip(tiles_meta, snap["tile_positions"])
     )
     st.code(positions_text)
 
     # Download buttons
     st.subheader("Download")
     out_format = _param("out_format", "PNG")
-    ext_map = {"PNG": "png", "TIFF (LZW)": "tif", "JPEG": "jpg"}
+    ext_map = {"PNG": "png", "JPEG": "jpg"}
     ext = ext_map.get(out_format, "png")
+    # The per-upload calibration produced at the top of this tab travels
+    # with the saved panorama; for the file download it goes into the
+    # calibration .txt sidecar offered below.
+    upload_calib = cross_section_map.get_calibration_for_upload(
+        snap.get("upload_sig"))
+    has_calib = bool(upload_calib and upload_calib.ok)
+    rgb = cv2.cvtColor(snap["panorama_bgr"], cv2.COLOR_BGR2RGB)
+    pan_h, pan_w = rgb.shape[:2]
+    data, dl_info = _snap_download_bytes(snap, snap["panorama_bgr"], rgb,
+                                         upload_calib, ext, "pan")
+    size_mb = len(data) / 1_000_000.0
 
-    if ext == "tif":
-        import tifffile
-        rgb = cv2.cvtColor(result.panorama, cv2.COLOR_BGR2RGB)
-        buf = io.BytesIO()
-        tifffile.imwrite(buf, rgb, compression="lzw")
-        data = buf.getvalue()
-        mime = "image/tiff"
-    else:
-        if ext == "png":
-            ok, buf = cv2.imencode(".png", result.panorama)
-            mime = "image/png"
-        else:
-            ok, buf = cv2.imencode(".jpg", result.panorama, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            mime = "image/jpeg"
-        data = buf.tobytes()
-
-    fname = f"panorama_{len(tiles)}_tiles.{ext}"
+    fname = f"panorama_{len(tiles_meta)}_tiles.{ext}"
     st.download_button(
-        label=f"Download panorama ({out_format})",
+        label=f"Download panorama ({out_format} · {size_mb:.1f} MB)",
         data=data,
         file_name=fname,
-        mime=mime,
+        mime="image/png" if ext == "png" else "image/jpeg",
+        key=f"dl_pan_{source.lower().replace(' ', '_')}",
     )
+    st.caption(f"File size: **{size_mb:.1f} MB** ({pan_w}×{pan_h} px). "
+               "PNG stores the panorama LOSSLESSLY — the pixels in the "
+               "file are exactly the pixels of the stitch, with no codec "
+               "layer that could alter them in any viewer.")
+    if has_calib:
+        st.caption(f"Calibration: "
+                   f"**{(1.0 / upload_calib.px_per_um):.6g} µm/px**. "
+                   "This format cannot store a reliable µm/px value "
+                   "(PNG keeps only integer pixels-per-metre in its "
+                   "pHYs chunk) — download the calibration sidecar "
+                   "(.txt) below together with the image.")
+        st.download_button(
+            label="Download calibration (.txt)",
+            data=cross_section_map.calibration_sidecar_text(
+                fname, pan_w, pan_h,
+                upload_calib).encode("utf-8"),
+            file_name=f"{fname.rsplit('.', 1)[0]}_calibration.txt",
+            mime="text/plain",
+            key=f"xmap_sidecar_{source.lower().replace(' ', '_')}",
+        )
+
+    # Keep the save-consumption snapshot fresh on EVERY rerun so the
+    # 'Save to Cross-section Map' button can store it via on_click.
+    st.session_state[cross_section_map.LAST_RESULT_KEY] = {
+        "panorama_bgr": snap["panorama_bgr"],
+        "first_tile_bgr": snap.get("first_tile_bgr"),
+        "source": source,
+        "upload_sig": snap.get("upload_sig"),
+    }
+    cross_section_map.render_save_button(
+        btn_key=f"xmap_save_{source.lower().replace(' ', '_')}")
 
     # Optional debug full-resolution panorama (when keep_full_panorama was ON
     # AND a single ROI band was applied — see pipeline.stitch_row docs).
-    pan_full = getattr(result, "panorama_full", None)
+    pan_full = snap.get("panorama_full")
     if pan_full is not None:
         st.caption(
             f"Debug full-resolution panorama (no ROI crop): "
             f"{pan_full.shape[1]}x{pan_full.shape[0]} px.")
-        if ext == "tif":
-            import tifffile
-            rgb_f = cv2.cvtColor(pan_full, cv2.COLOR_BGR2RGB)
-            buf_f = io.BytesIO()
-            tifffile.imwrite(buf_f, rgb_f, compression="lzw")
-            data_f = buf_f.getvalue()
-            mime_f = "image/tiff"
-        elif ext == "png":
-            _, buf_f = cv2.imencode(".png", pan_full)
-            data_f = buf_f.tobytes()
-            mime_f = "image/png"
-        else:
-            _, buf_f = cv2.imencode(".jpg", pan_full,
-                                    [cv2.IMWRITE_JPEG_QUALITY, 95])
-            data_f = buf_f.tobytes()
-            mime_f = "image/jpeg"
+        rgb_f = cv2.cvtColor(pan_full, cv2.COLOR_BGR2RGB)
+        data_f, dl_info_f = _snap_download_bytes(
+            snap, pan_full, rgb_f, upload_calib, ext, "full")
         st.download_button(
-            label=f"Download panorama (FULL — debug, {out_format})",
+            label=(f"Download panorama (FULL — debug, {out_format} · "
+                   f"{len(data_f) / 1_000_000.0:.1f} MB)"),
             data=data_f,
-            file_name=f"panorama_{len(tiles)}_tiles_full.{ext}",
-            mime=mime_f,
+            file_name=f"panorama_{len(tiles_meta)}_tiles_full.{ext}",
+            mime="image/png" if ext == "png" else "image/jpeg",
         )
 
     # CSV with tile positions
@@ -745,15 +851,26 @@ def render_stitch_result(result, tiles):
     csv_buf = io.StringIO()
     writer = csv.writer(csv_buf)
     writer.writerow(["tile_name", "tile_index", "offset_x", "offset_y", "width", "height"])
-    for t, pos in zip(tiles, result.tile_positions):
-        h, w = t.image.shape[:2]
-        writer.writerow([t.name, t.index, pos[0], pos[1], w, h])
+    for t, pos in zip(tiles_meta, snap["tile_positions"]):
+        writer.writerow([t["name"], t["index"], pos[0], pos[1],
+                         t["w"], t["h"]])
     st.download_button(
         label="Download tile positions (CSV)",
         data=csv_buf.getvalue().encode("utf-8"),
         file_name="tile_positions.csv",
         mime="text/csv",
+        key=f"dl_csv_{source.lower().replace(' ', '_')}",
     )
+
+    if snap_key:
+        if st.button("Hide result (clear downloads)",
+                     key=f"clear_{snap_key}",
+                     help="Remove the persisted result from this session "
+                          "(e.g. to free memory). Re-run the stitch to "
+                          "recreate it."):
+            st.session_state.pop(snap_key, None)
+            st.session_state.pop(cross_section_map.LAST_RESULT_KEY, None)
+            st.rerun()
 
 
 def render_help_tab():
@@ -770,7 +887,7 @@ def render_help_tab():
         "3. **Run**: click **Stitch panorama** (Stitcher tab) — or use the "
         "**Pair Review** tab to check and correct every pair manually first."
         "\n"
-        "4. **Download**: panorama (PNG/TIFF/JPEG) and tile positions CSV."
+        "4. **Download**: panorama (PNG/JPEG) and tile positions CSV."
     )
 
     st.markdown("---")
@@ -1087,6 +1204,44 @@ def render_help_tab():
         "0 = off, 1 = full correction. Useful when illumination varies between shots. |"
     )
 
+    st.markdown("### Output Format & result checks")
+    st.markdown(
+        "| Setting / tool | Default | Effect |"
+        "\n"
+        "|---|---|---|"
+        "\n"
+        "| **Output format** | PNG | The panorama download is LOSSLESS: "
+        "the pixels in the file are exactly the pixels of the stitch. "
+        "JPEG (quality 95) is available as the smaller alternative. The "
+        "TIFF export was removed at the operator's request — the x100 "
+        "panorama in TIFF opened black-grey or with grey 'broken' pixels "
+        "in third-party viewers, while PNG stores the identical pixels "
+        "without any codec layer and is displayed correctly everywhere. "
+        "The µm/px calibration travels in the `.txt` sidecar offered "
+        "next to every image download. |"
+        "\n"
+        "| **Calibration & stitch check** | — | Shown with every stitch "
+        "result (Stitcher AND Pair Review). Click the two opposite edges "
+        "of the TEM disk on the panorama (or any other feature of known "
+        "length): the app measures the distance in px and µm and compares "
+        "it with the expected value (default 2200 µm — set it to the "
+        "actual disk diameter; standard TEM disks are 3.05 mm). The "
+        "clicks belong to the current panorama: a new stitch or another "
+        "uploaded series starts a fresh measurement. A large deviation "
+        "means a wrong calibration and/or a wrong pair offset — the "
+        "fastest health check of the whole panorama. |"
+        "\n"
+        "| **Broken pixel repair** | — | Shown with every stitch result. "
+        "The blend already repairs seam slivers and isolated outliers "
+        "automatically; this tool re-scans the finished panorama with "
+        "TWO detectors — the 3×3-median outlier scan for specks and the "
+        "smooth-patch scan (9×9…31×31 window) for grey seam BANDS wider "
+        "than 3 px, which are locally flat and therefore invisible to "
+        "the 3×3 median — and repairs the survivors in place (pixels "
+        "adjacent to pure-black gap borders are protected from the "
+        "speck scan). 'Restore original' undoes the repair. |"
+    )
+
     st.markdown("### Backup Methods")
     st.markdown(
         "When SIFT fails to find enough inliers, the app falls back to alternative methods "
@@ -1327,7 +1482,11 @@ def render_sidebar() -> None:
     """
     st.sidebar.header("Method Settings")
 
-    with st.sidebar.expander("Upload", expanded=True):
+    # All sidebar sections start COLLAPSED (operator request): an
+    # initially-open "Feature Detection" expander pushed the rest of the
+    # sidebar down and distracted from the upload flow. Every section is
+    # one click away; the widget states survive collapsing.
+    with st.sidebar.expander("Upload", expanded=False):
         upload_mode = st.radio(
             "Upload method",
             ["Multiple files", "ZIP archive"],
@@ -1429,7 +1588,7 @@ def render_sidebar() -> None:
             ),
         )
 
-    with st.sidebar.expander("Feature Detection", expanded=True):
+    with st.sidebar.expander("Feature Detection", expanded=False):
         st.selectbox(
             "Estimation resolution (max side, px)",
             options=["Full resolution", 2000, 1600, 1200, 800],
@@ -1574,8 +1733,18 @@ def render_sidebar() -> None:
                  "correlation scan. Fixes single frames shifted up or down.")
 
     with st.sidebar.expander("Output Format", expanded=False):
-        st.selectbox("Output format", ["PNG", "TIFF (LZW)", "JPEG"], index=0,
-                     key="out_format")
+        st.selectbox(
+            "Output format",
+            ["PNG", "JPEG"], index=0,
+            key="out_format",
+            help="PNG — lossless, identical pixels, the guaranteed-intact "
+                 "format for the stitched panorama. JPEG — smaller file, "
+                 "quality 95. The TIFF export was REMOVED at the "
+                 "operator's request: the x100 panorama in TIFF suffered "
+                 "from black-grey output and grey 'broken' pixels in "
+                 "third-party viewers, while PNG stores exactly the same "
+                 "pixels without any codec layer. The calibration .txt "
+                 "sidecar is offered next to every image download.")
 
 
 def render_stitcher_tab():
@@ -1621,6 +1790,22 @@ def render_stitcher_tab():
     st.success(f"Loaded {len(tiles)} images")
     st.write(f"Stitching order: {' -> '.join(t.name for t in tiles)}")
 
+    # === Calibration (µm per pixel) — top of the Stitcher tab ===
+    # Step 1: auto-search the metadata of every tile. Step 2: accept the
+    # metadata calibration OR decline. Step 3 (after Decline): pick a
+    # tile, then auto-search the whole tile / ROI + auto / ROI + manual
+    # two-clicks along the scale bar. The resulting calibration is keyed
+    # by the upload signature in session_state and is attached to the
+    # saved panorama by the 'Save to Cross-section Map' button.
+    try:
+        cross_section_map.render_calibration_section(
+            tiles, role="Stitcher",
+            sig=_current_upload_signature())
+    except Exception as e:
+        st.warning(f"Calibration block error: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
     # Preview uploaded tiles
     with st.expander("Preview uploaded tiles", expanded=False):
         cols = st.columns(min(len(tiles), 5))
@@ -1648,55 +1833,66 @@ def render_stitcher_tab():
                 _render_stitcher_roi_reference_ui(
                     tiles, float(_param("roi_height_fraction", 0.30)))
 
+    # Drop the persisted result of a PREVIOUS upload (the snapshot is
+    # keyed to the upload signature; a new series invalidates it).
+    if st.session_state.get(_RESULT_SNAP_STITCHER, {}).get(
+            "upload_sig") != _current_upload_signature():
+        st.session_state.pop(_RESULT_SNAP_STITCHER, None)
+
     # Run button
-    if not st.button("Stitch panorama", type="primary"):
-        return
+    if st.button("Stitch panorama", type="primary"):
+        # Progress
+        progress = st.progress(0.0, "Initializing...")
 
-    # Progress
-    progress = st.progress(0.0, "Initializing...")
+        def update_progress(msg, p):
+            progress.progress(min(max(p, 0.0), 1.0), msg)
 
-    def update_progress(msg, p):
-        progress.progress(min(max(p, 0.0), 1.0), msg)
+        # Run stitching (settings come from the shared sidebar via _param)
+        try:
+            eo = _param("expected_overlap", 0)
+            ems = _param("estimation_max_side", 1600)
+            roi_band, roi_bands_per_tile, roi_label, keep_full = \
+                _resolve_roi_band_for_stitcher(tiles)
+            result = pipeline.stitch_row(
+                tiles,
+                n_features=_param("n_features", 2000),
+                ratio_thresh=_param("ratio_thresh", 0.75),
+                ransac_thresh=_param("ransac_thresh", 5.0),
+                use_clahe=_param("use_clahe", True),
+                clahe_clip=_param("clahe_clip", 3.0),
+                min_inliers_sift=_param("min_inliers", 8),
+                enable_phase_fallback=_param("enable_phase", True),
+                enable_ncc_fallback=_param("enable_ncc", True),
+                verify_with_ncc=_param("verify_with_ncc", True),
+                ncc_verify_gap=_param("ncc_verify_gap", 0.07),
+                suppress_fixed_pattern=_param("suppress_fixed_pattern", True),
+                enable_drift_guard=_param("enable_drift_guard", True),
+                expected_overlap_pct=(eo if eo > 0 else None),
+                estimation_max_side=(ems if isinstance(ems, int) else None),
+                blend_levels=_param("blend_levels", 3),
+                blend_feather=_param("blend_feather", 64),
+                blend_gamma=_param("blend_gamma", 1.5),
+                blend_gain_strength=_param("gain_strength", 0.8),
+                **_blend_mode_params(),
+                roi_band=roi_band,
+                roi_bands_per_tile=roi_bands_per_tile,
+                keep_full_panorama=keep_full,
+                progress_callback=update_progress,
+            )
+        except Exception as e:
+            st.error(f"Stitching error: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return
+        # Persist the result: the block below (with ALL download/save
+        # buttons) survives every rerun instead of vanishing after the
+        # first download/save click.
+        st.session_state[_RESULT_SNAP_STITCHER] = _result_snapshot(
+            result, tiles, "Stitcher")
 
-    # Run stitching (settings come from the shared sidebar via _param)
-    try:
-        eo = _param("expected_overlap", 0)
-        ems = _param("estimation_max_side", 1600)
-        roi_band, roi_bands_per_tile, roi_label, keep_full = \
-            _resolve_roi_band_for_stitcher(tiles)
-        result = pipeline.stitch_row(
-            tiles,
-            n_features=_param("n_features", 2000),
-            ratio_thresh=_param("ratio_thresh", 0.75),
-            ransac_thresh=_param("ransac_thresh", 5.0),
-            use_clahe=_param("use_clahe", True),
-            clahe_clip=_param("clahe_clip", 3.0),
-            min_inliers_sift=_param("min_inliers", 8),
-            enable_phase_fallback=_param("enable_phase", True),
-            enable_ncc_fallback=_param("enable_ncc", True),
-            verify_with_ncc=_param("verify_with_ncc", True),
-            ncc_verify_gap=_param("ncc_verify_gap", 0.07),
-            suppress_fixed_pattern=_param("suppress_fixed_pattern", True),
-            enable_drift_guard=_param("enable_drift_guard", True),
-            expected_overlap_pct=(eo if eo > 0 else None),
-            estimation_max_side=(ems if isinstance(ems, int) else None),
-            blend_levels=_param("blend_levels", 3),
-            blend_feather=_param("blend_feather", 64),
-            blend_gamma=_param("blend_gamma", 1.5),
-            blend_gain_strength=_param("gain_strength", 0.8),
-            **_blend_mode_params(),
-            roi_band=roi_band,
-            roi_bands_per_tile=roi_bands_per_tile,
-            keep_full_panorama=keep_full,
-            progress_callback=update_progress,
-        )
-    except Exception as e:
-        st.error(f"Stitching error: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-        return
-
-    render_stitch_result(result, tiles)
+    snap = st.session_state.get(_RESULT_SNAP_STITCHER)
+    if snap is not None:
+        render_stitch_result(snap, snap_key=_RESULT_SNAP_STITCHER)
 
 
 def render_pair_review_tab():
@@ -1728,6 +1924,20 @@ def render_pair_review_tab():
     n_pairs = n - 1
     tile_names = [t.name for t in tiles]
     sig = _current_upload_signature()
+
+    # === Calibration (µm per pixel) — top of the Pair Review tab ===
+    # Same flow as in the Stitcher tab: metadata auto-search, then
+    # accept/decline, then (after Decline) pick a tile and run one of
+    # three manual modes (full auto / ROI + auto / ROI + two clicks).
+    # The calibration is keyed by the upload signature — it is shared
+    # with the Stitcher tab if the SAME series is uploaded there.
+    try:
+        cross_section_map.render_calibration_section(
+            tiles, role="Pair Review", sig=sig)
+    except Exception as e:
+        st.warning(f"Calibration block error: {e}")
+        import traceback
+        st.code(traceback.format_exc())
 
     # =================== Step 1 — estimate ===================
     st.subheader("Step 1 — Automatic position estimate")
@@ -2342,8 +2552,20 @@ def render_pair_review_tab():
             import traceback
             st.code(traceback.format_exc())
             return
+        # Persist the result: the block below (with ALL download/save
+        # buttons) survives every rerun instead of vanishing after the
+        # first download/save click.
+        st.session_state[_RESULT_SNAP_PAIR] = _result_snapshot(
+            result, tiles, "Pair Review")
 
-        render_stitch_result(result, tiles)
+    # Render the persisted result on EVERY rerun (the stitch button is
+    # only pressed once; downloads/saves must not make the block vanish).
+    snap_pair = st.session_state.get(_RESULT_SNAP_PAIR)
+    if snap_pair is not None:
+        if snap_pair.get("upload_sig") != sig:
+            st.session_state.pop(_RESULT_SNAP_PAIR, None)
+        else:
+            render_stitch_result(snap_pair, snap_key=_RESULT_SNAP_PAIR)
 
 
 # === Render the active section ===
@@ -2354,5 +2576,7 @@ if nav_tab == "Stitcher":
     render_stitcher_tab()
 elif nav_tab == "Pair Review":
     render_pair_review_tab()
+elif nav_tab == "Cross-section Map":
+    cross_section_map.render_map_tab()
 else:
     render_help_tab()
