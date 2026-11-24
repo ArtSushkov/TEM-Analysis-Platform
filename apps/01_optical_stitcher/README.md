@@ -234,8 +234,13 @@ DEFAULT):
    correct before applying anything. A **colour tolerance** slider
    handles noisy JPEG artefacts. The value is then read by OCR (tall
    label windows ABOVE **and** BELOW the bar are both tried; the
-   window that produced the reading is reported) or typed in and
-   applied explicitly. This is the recommended mode when the bar is
+   window that produced the reading is reported). The windows
+   grow PROGRESSIVELY — three levels (base, tall, extra-tall,
+   each also wider) — while no trustworthy value is found, so a
+   label sitting far above/below the bar is captured too (the
+   earlier fixed-height window sometimes could not contain the
+   number at all). The value can also be typed in and applied
+   explicitly. This is the recommended mode when the bar is
    thin and precise end-to-end clicking (mode 2) is fiddly.
 2. **Draw ROI on the tile, then click two ends of the bar** — draw the
    ROI with two clicks (click 1 = upper-left corner, click 2 =
@@ -285,6 +290,15 @@ session (a new upload also clears it automatically).
     exactly the same pixels losslessly with no codec layer that any
     viewer could reinterpret. The panorama bytes are cached per format
     and calibration, so repeated downloads do not re-encode the image.
+  - **Very wide panoramas**: the JPEG format itself cannot store a side
+    longer than 65500 px — a ~99 000 px wide panorama is downscaled to
+    65500 px for the JPEG download automatically (a caption says so);
+    PNG has no such limit and downloads at the FULL resolution. If the
+    encoder fails on a low-RAM machine, a second encoder + (as a last
+    resort) a downscaled PNG fallback are tried, and a persistent
+    failure shows a red error message instead of a silently empty
+    download (a failed encode is never cached — pressing the button
+    again retries).
   - **PNG / JPEG** cannot store a reliable µm/px value (the PNG `pHYs`
     chunk holds only INTEGER pixels-per-metre and most viewers ignore
     it) — an additional **Download calibration (.txt)** button offers a
@@ -332,13 +346,19 @@ the x100 detail (top view of the IC cross-section). Workflow:
    another (each spans the full page width). Picking is TWO-STEP (the
    operator's request for pixel-precise agreement between the x10 and x100
    points): the FIRST click on a preview does NOT fix the pixel — it opens a
-   MAGNIFIED fragment (220 px window of the full-resolution panorama,
-   enlarged x6, red crosshair + orange box at the first click); the SECOND
-   click INSIDE the magnified fragment fixes the exact point and prefills
-   the coordinate fields. "Cancel magnifier" closes it without fixing
-   anything. From 3 tie points an optional **Affine** mapping model becomes
-   available — it adds anisotropic scale + shear and absorbs the tilt
-   distortion of the x10 view (part of the large mid-panorama errors).
+   MAGNIFIED fragment (a 760 px window of the full-resolution panorama —
+   about three times the area of the previous 440 px window — rendered
+   ~1280 px wide with an adaptive nearest-neighbour zoom, red crosshair +
+   orange box at the first click); the SECOND click INSIDE the magnified
+   fragment fixes the exact point and prefills the coordinate fields.
+   "Cancel magnifier" closes it without fixing anything. If a preview ever
+   shows up blank / not clickable (e.g. the browser discarded its iframe on
+   a low-memory machine), press **'Previews blank / not clickable? —
+   Restore'** under the x100 coordinate fields: both previews are re-mounted
+   with fresh widget keys, all picked points are kept. From 3 tie points an
+   optional **Affine** mapping model becomes available — it adds anisotropic
+   scale + shear and absorbs the tilt distortion of the x10 view (part of
+   the large mid-panorama errors).
 4. **Consistency check** — the physical distance between every pair of tie
    points is computed on BOTH panoramas via their calibrations; the distances
    must match (same disk!). A deviation above 5 % means one of the

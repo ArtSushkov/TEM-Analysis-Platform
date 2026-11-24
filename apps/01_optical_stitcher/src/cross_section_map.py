@@ -202,13 +202,37 @@ CAL_WIDTH_DEFAULT = 1280
 # enlarged fragment around it, and the SECOND click inside that fragment
 # gives the exact point"). The magnifier is a square window of
 # 2*TIE_ZOOM_HALF_PX full-res panorama pixels around the first click,
-# ENLARGED TIE_ZOOM_FACTOR times (nearest-neighbour — pixels stay crisp)
-# and rendered TIE_ZOOM_DISPLAY_WIDTH CSS px wide. 220 px window at 6x on
-# a ~720 px widget = every x10/x100 pixel spans ~3 screen pixels —
-# ~20x finer than picking on the whole-panorama preview.
-TIE_ZOOM_HALF_PX = 110          # full-res px, half-window of the magnifier
-TIE_ZOOM_FACTOR = 6.0           # magnification of the enlarged fragment
-TIE_ZOOM_DISPLAY_WIDTH = 720    # CSS px width of the magnifier widget
+# enlarged by an ADAPTIVE factor (see _tie_zoom_pick_block) so the widget
+# shows the fragment at ~TIE_ZOOM_DISPLAY_WIDTH CSS px.
+# ENLARGED AGAIN (the operator's follow-up request: "the fragment area
+# after the first click must be ANOTHER ~3x bigger — it must be clearer
+# where to click"): the window grew 440 -> 760 px (area 440^2 -> 760^2 =
+# x2.98 of the previous step, x11.9 of the original 220 px window) and
+# the widget grew 900 -> 1280 CSS px (the same width the calibration
+# snapshots use by default). The effective on-screen zoom is ~1.68 screen
+# px per panorama pixel; the click -> full-res mapping stays exact (the
+# widget rescales by the displayed size), so precision is not lost — the
+# AIMING CONTEXT is three times larger.
+TIE_ZOOM_HALF_PX = 380          # full-res px, half-window of the magnifier
+TIE_ZOOM_FACTOR = 2.0           # kept for compatibility (adaptive factor
+                                # computed per window in _tie_zoom_pick_block)
+TIE_ZOOM_DISPLAY_WIDTH = 1280   # CSS px width of the magnifier widget
+
+# Display width (CSS px) of the whole-panorama tie-point previews
+# (section "3 · Tie points (disk edges)"). These previews now use the
+# EXPLICIT NUMERIC sizing (width/height sent from Python) instead of the
+# CSS "stretch to column" mode — the same reliable mode the calibration
+# snapshots use. Why it matters for the operator's "the panoramas
+# disappear on clicking" report: the stretch mode sizes the component's
+# iframe from the BROWSER layout at mount time, so a preview that is
+# re-mounted while the page structure changes (the magnifier of the
+# other panorama opens/closes, tie points are added) can end up with a
+# stale frame height / a blank render. With numeric sizing the frame
+# height is a CONSTANT sent from Python, identical on every mount and
+# every rerun, so the preview can never be cut off or render empty.
+# The previews are also slightly UPSCALED on screen (natural width 1000
+# px -> 1280 CSS px), which makes aiming easier.
+TIE_PREVIEW_DISPLAY_WIDTH = 1280
 
 # Manual calibration modes (Step 3 of the calibration flow). The two
 # auto-search modes were REMOVED at the operator's request, and the two
@@ -618,7 +642,12 @@ def ocr_scale_label(img_rgb: np.ndarray,
        tesseract reads the overlay text, not the dust;
     2. additionally tries plain-grayscale variants (labels that are not
        bar-coloured), several upscale factors, both polarities and
-       several page-segmentation modes;
+       several page-segmentation modes; the label windows themselves
+       grow PROGRESSIVELY — three levels (base, tall, extra-tall, each
+       also wider) — and every level that still yields no trustworthy
+       value triggers the next, taller one, so a label sitting far
+       above/below the bar is captured too (operator report: the value
+       "did not fit" into the first window and OCR found nothing);
     3. collects EVERY reading and RANKS the parses instead of letting
        the first one win: a value with an explicit unit, a plausible
        scale-bar magnitude (5–5000 µm) and 2+ digits beats a bare
@@ -647,23 +676,36 @@ def ocr_scale_label(img_rgb: np.ndarray,
     bh = max(1, bar.y1 - bar.y0)
     bw = max(1, bar.x1 - bar.x0)
     cx, _ = bar.center
-    pad_x = int(bw * 1.25) + 30
-    # TALL label windows: at least 100 px above AND below the bar. The
-    # old int(bh*6) + 30 gave a ~36 px window for a one-pixel traced bar
-    # — too small when the label sits a few dozen pixels away from the
-    # bar (the "OCR does not work below the bar" report).
-    pad_y = max(int(bh * 6) + 30, 100)
-    x0, x1 = max(0, cx - pad_x), min(w, cx + pad_x)
-    y_top = max(0, bar.y0 - pad_y)
-    y_bot = min(h, bar.y1 + pad_y)
-    windows = [
-        ("above the bar",
-         img_rgb[y_top:max(y_top, bar.y0 - 2), x0:x1]),
-        ("below the bar",
-         img_rgb[min(h, bar.y1 + 2):y_bot, x0:x1]),
-        ("around the bar (centre fallback)",
-         img_rgb[y_top:y_bot, x0:x1]),
-    ]
+    # TALL label windows with a PROGRESSIVE LADDER (operator report: the
+    # label sometimes sits FAR above the bar and did not fit into the
+    # first window at all, so OCR "could not determine anything").
+    # Level 1 keeps the proven base geometry (>=100 px above AND below
+    # the bar; the old int(bh*6) + 30 gave a ~36 px window for a
+    # one-pixel traced bar — too small when the label sits a few dozen
+    # pixels away). When a level produces NO trustworthy reading, the
+    # windows are rebuilt TALLER and WIDER — every level accumulates
+    # readings, and the first level that yields a trusted value wins,
+    # so the common case stays exactly as fast as before.
+    _PAD_LADDER = (
+        # (pad_y, pad_x, window-name tag)
+        (max(int(bh * 6) + 30, 100), int(bw * 1.25) + 30, ""),
+        (max(int(bh * 12) + 60, 240), int(bw * 1.6) + 60, " [tall window]"),
+        (max(int(bh * 20) + 100, 400), int(bw * 2.0) + 100,
+         " [extra-tall window]"),
+    )
+
+    def _windows_for(pad_y: int, pad_x: int, tag: str):
+        x0, x1 = max(0, cx - pad_x), min(w, cx + pad_x)
+        y_top = max(0, bar.y0 - pad_y)
+        y_bot = min(h, bar.y1 + pad_y)
+        return [
+            (f"above the bar{tag}",
+             img_rgb[y_top:max(y_top, bar.y0 - 2), x0:x1]),
+            (f"below the bar{tag}",
+             img_rgb[min(h, bar.y1 + 2):y_bot, x0:x1]),
+            (f"around the bar (centre fallback){tag}",
+             img_rgb[y_top:y_bot, x0:x1]),
+        ]
     # Reference overlay colour: the caller (mode-4 trace) knows it best;
     # otherwise re-measure it from the bar strip itself.
     ref: Optional[np.ndarray] = None
@@ -685,6 +727,10 @@ def ocr_scale_label(img_rgb: np.ndarray,
     best_crop: Optional[np.ndarray] = None
     best_where = ""
     err_msg: Optional[str] = None
+    # Window crops by name — so the UI can show EXACTLY the window the
+    # winning reading came from, even when that window belongs to a
+    # taller ladder level.
+    crop_by_wname: dict = {}
 
     def _run_ocr(variants: List[Tuple[str, np.ndarray]], wname: str,
                  crop: Optional[np.ndarray]) -> None:
@@ -712,106 +758,122 @@ def ocr_scale_label(img_rgb: np.ndarray,
                 if err_msg is not None:
                     return
 
-    for wname, crop in windows:
-        if crop.size == 0:
-            continue
-        variants: List[Tuple[str, np.ndarray]] = []
-        # 1) Colour-isolated variants — overlay glyphs only. Built at
-        #    NATIVE resolution (mask first, upscale afterwards) so the
-        #    anti-aliased glyph edges stay crisp. A mask only counts as
-        #    a TRUST anchor when it looks like TEXT: several small
-        #    glyph-sized blobs. A mask dominated by huge blobs is just
-        #    sample texture in a similar colour — its readings get no
-        #    extra trust ("colour-weak").
-        if ref is not None:
-            c32 = crop.astype(np.float32)
-            dist = np.sqrt(((c32 - ref[None, None, :]) ** 2).sum(axis=2))
-            for tol in (60.0, 90.0):
-                m8 = (dist <= tol).astype(np.uint8)
-                if m8.any() and m8.mean() <= 0.60:
-                    m8o = cv2.morphologyEx(
-                        m8, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-                    # glyph-structure check on the opened mask
-                    n_lbl, _, st_lbl, _ = \
-                        cv2.connectedComponentsWithStats(m8o)
-                    glyphs = [s for s in st_lbl[1:]
-                              if 4 <= s[3] <= 80 and 2 <= s[2] <= 120]
-                    glyph_like = (len(glyphs) >= 3
-                                  and len(glyphs) >= 0.5 * max(1, n_lbl - 1))
-                    vname = (f"colour-mask tol{tol:.0f}" if glyph_like
-                             else f"colour-weak tol{tol:.0f}")
-                    variants.append(
-                        (vname, np.where(m8o.astype(bool),
-                                         0, 255).astype(np.uint8)))
-        # 2) Plain-grayscale variants (labels in another colour / b/w).
-        for fx in (3.0, 5.0):
-            big = cv2.resize(crop, None, fx=fx, fy=fx,
-                             interpolation=cv2.INTER_CUBIC)
-            variants.append((f"gray x{fx:.0f}",
-                             cv2.cvtColor(big, cv2.COLOR_RGB2GRAY)))
-        # Colour masks are upscaled AFTER binarisation, grayscale before:
-        # bring the masks to a comparable pixel height too.
-        upscaled: List[Tuple[str, np.ndarray]] = []
-        for vname, var in variants:
-            hh = var.shape[0]
-            if hh < 140:
-                f = min(6.0, 140.0 / max(1, hh))
-                var = cv2.resize(var, None, fx=f, fy=f,
-                                 interpolation=cv2.INTER_NEAREST)
-            upscaled.append((vname, var))
-        _run_ocr(upscaled, wname, crop)
-        if err_msg is not None:
-            return best_raw, f"error:{err_msg}", best_crop
+    def _trusted_hit() -> Optional[Tuple[str, str, Optional[np.ndarray]]]:
+        """Rank the readings collected SO FAR.
 
-    # Rank the parses. TRUST rules — a reading is only applied when it
-    # has a physical anchor; bare noise digits ("3 instead of 200") are
-    # never trusted:
-    #   a) an explicit unit right after the number (tesseract renders
-    #      µ as '?' — "?m" is accepted too);
-    #   b) the value was read from a GLYPH-LIKE colour-mask variant
-    #      (small text blobs in the bar's own colour) AND the magnitude
-    #      is plausible (10–2000 µm without a unit);
-    #   c) 3+ digits AND plausible magnitude;
-    #   d) the SAME value was read in 2+ different windows (above and
-    #      the centre fallback overlap, so a real label agrees with
-    #      itself; random noise rarely repeats a 2+ digit value).
-    UNIT_SUFFIX_RE = re.compile(
-        r"\s{0,3}(?:µm|μm|um|um|nm|mm|\?{1,2}m|µ|μ|u)", re.IGNORECASE)
+        Returns ``(raw, status, crop)`` of the best TRUSTED parse, or
+        None when nothing is trusted yet. TRUST rules — a reading is
+        only applied when it has a physical anchor; bare noise digits
+        ("3 instead of 200") are never trusted:
+          a) an explicit unit right after the number (tesseract renders
+             µ as '?' — "?m" is accepted too);
+          b) the value was read from a GLYPH-LIKE colour-mask variant
+             (small text blobs in the bar's own colour) AND the magnitude
+             is plausible (10–2000 µm without a unit);
+          c) 3+ digits AND plausible magnitude;
+          d) the SAME value was read in 2+ different windows (above and
+             the centre fallback overlap, so a real label agrees with
+             itself; random noise rarely repeats a 2+ digit value).
+        """
+        UNIT_SUFFIX_RE = re.compile(
+            r"\s{0,3}(?:µm|μm|um|um|nm|mm|\?{1,2}m|µ|μ|u)", re.IGNORECASE)
 
-    def _has_unit(text: str) -> bool:
-        for m in _SCALE_RE.finditer(text):
-            if UNIT_SUFFIX_RE.match(text[m.end():m.end() + 6]):
-                return True
-        return False
+        def _has_unit(text: str) -> bool:
+            for m in _SCALE_RE.finditer(text):
+                if UNIT_SUFFIX_RE.match(text[m.end():m.end() + 6]):
+                    return True
+            return False
 
-    value_windows: dict = {}
-    for raw, parsed, wname, _vn, _im in readings:
-        if parsed is not None:
-            value_windows.setdefault(round(parsed[0], 3), set()).add(wname)
-    candidates: List[Tuple[float, str, Tuple[float, str], str]] = []
-    for raw, parsed, wname, _vn, is_mask in readings:
-        if parsed is None:
-            continue
-        unit = _has_unit(raw)
-        plausible = (10.0 <= parsed[0] <= 2000.0 if not unit
-                     else 0.2 <= parsed[0] <= 20000.0)
-        ndig = len(re.sub(r"\D", "", parsed[1]))
-        agree = len(value_windows.get(round(parsed[0], 3), ()))
-        trusted = (unit or (is_mask and plausible)
-                   or (plausible and ndig >= 3)
-                   or (plausible and ndig >= 2 and agree >= 2))
-        if not trusted:
-            continue
-        score = ((4.0 if unit else 0.0)
-                 + (3.0 if plausible else 0.0)
-                 + (2.0 if is_mask else 0.0)
-                 + (1.5 if ndig >= 3 else (0.5 if ndig >= 2 else 0.0))
-                 + (2.0 if agree >= 2 else 0.0))
-        candidates.append((score, raw, parsed, wname))
-    if candidates:
+        value_windows: dict = {}
+        for raw, parsed, wname, _vn, _im in readings:
+            if parsed is not None:
+                value_windows.setdefault(round(parsed[0], 3), set()).add(wname)
+        candidates: List[Tuple[float, str, Tuple[float, str], str]] = []
+        for raw, parsed, wname, _vn, is_mask in readings:
+            if parsed is None:
+                continue
+            unit = _has_unit(raw)
+            plausible = (10.0 <= parsed[0] <= 2000.0 if not unit
+                         else 0.2 <= parsed[0] <= 20000.0)
+            ndig = len(re.sub(r"\D", "", parsed[1]))
+            agree = len(value_windows.get(round(parsed[0], 3), ()))
+            trusted = (unit or (is_mask and plausible)
+                       or (plausible and ndig >= 3)
+                       or (plausible and ndig >= 2 and agree >= 2))
+            if not trusted:
+                continue
+            score = ((4.0 if unit else 0.0)
+                     + (3.0 if plausible else 0.0)
+                     + (2.0 if is_mask else 0.0)
+                     + (1.5 if ndig >= 3 else (0.5 if ndig >= 2 else 0.0))
+                     + (2.0 if agree >= 2 else 0.0))
+            candidates.append((score, raw, parsed, wname))
+        if not candidates:
+            return None
         candidates.sort(key=lambda c: -c[0])
-        _score, raw, parsed, wname = candidates[0]
-        return raw, f"parsed@{wname}", best_crop
+        _score, raw, _parsed, wname = candidates[0]
+        return raw, f"parsed@{wname}", crop_by_wname.get(wname, best_crop)
+
+    # Progressive ladder: level 1 = the proven base geometry (fast);
+    # taller/wider windows run only while NO trustworthy reading exists.
+    for pad_y, pad_x, tag in _PAD_LADDER:
+        for wname, crop in _windows_for(pad_y, pad_x, tag):
+            if crop.size == 0:
+                continue
+            crop_by_wname[wname] = crop
+            variants: List[Tuple[str, np.ndarray]] = []
+            # 1) Colour-isolated variants — overlay glyphs only. Built at
+            #    NATIVE resolution (mask first, upscale afterwards) so the
+            #    anti-aliased glyph edges stay crisp. A mask only counts as
+            #    a TRUST anchor when it looks like TEXT: several small
+            #    glyph-sized blobs. A mask dominated by huge blobs is just
+            #    sample texture in a similar colour — its readings get no
+            #    extra trust ("colour-weak").
+            if ref is not None:
+                c32 = crop.astype(np.float32)
+                dist = np.sqrt(((c32 - ref[None, None, :]) ** 2).sum(axis=2))
+                for tol in (60.0, 90.0):
+                    m8 = (dist <= tol).astype(np.uint8)
+                    if m8.any() and m8.mean() <= 0.60:
+                        m8o = cv2.morphologyEx(
+                            m8, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+                        # glyph-structure check on the opened mask
+                        n_lbl, _, st_lbl, _ = \
+                            cv2.connectedComponentsWithStats(m8o)
+                        glyphs = [s for s in st_lbl[1:]
+                                  if 4 <= s[3] <= 80 and 2 <= s[2] <= 120]
+                        glyph_like = (len(glyphs) >= 3
+                                      and len(glyphs) >= 0.5 * max(1, n_lbl - 1))
+                        vname = (f"colour-mask tol{tol:.0f}" if glyph_like
+                                 else f"colour-weak tol{tol:.0f}")
+                        variants.append(
+                            (vname, np.where(m8o.astype(bool),
+                                             0, 255).astype(np.uint8)))
+            # 2) Plain-grayscale variants (labels in another colour / b/w).
+            for fx in (3.0, 5.0):
+                big = cv2.resize(crop, None, fx=fx, fy=fx,
+                                 interpolation=cv2.INTER_CUBIC)
+                variants.append((f"gray x{fx:.0f}",
+                                 cv2.cvtColor(big, cv2.COLOR_RGB2GRAY)))
+            # Colour masks are upscaled AFTER binarisation, grayscale before:
+            # bring the masks to a comparable pixel height too.
+            upscaled: List[Tuple[str, np.ndarray]] = []
+            for vname, var in variants:
+                hh = var.shape[0]
+                if hh < 140:
+                    f = min(6.0, 140.0 / max(1, hh))
+                    var = cv2.resize(var, None, fx=f, fy=f,
+                                     interpolation=cv2.INTER_NEAREST)
+                upscaled.append((vname, var))
+            _run_ocr(upscaled, wname, crop)
+            if err_msg is not None:
+                return best_raw, f"error:{err_msg}", best_crop
+        hit = _trusted_hit()
+        if hit is not None:
+            return hit
+
+    # No trusted value in ANY window of the ladder — surface the raw
+    # text (transparency) without pre-filling the value field with it.
     return (best_raw,
             (f"raw@{best_where}" if best_raw else "empty"),
             best_crop)
@@ -1365,15 +1427,15 @@ def downscale(img_rgb: np.ndarray,
     return np.ascontiguousarray(prev), s
 
 
-def render_crop(img_rgb: np.ndarray,
-                cx: float,
-                cy: float,
-                half_px: float) -> Tuple[np.ndarray, Tuple[float, float], bool]:
-    """Crop a (2*half)^2 window around (cx, cy), clamped to the image.
+def _crop_window(H: int, W: int, cx: float, cy: float,
+                 half_px: float) -> Tuple[int, int, int, int, bool]:
+    """Geometry of the clamped crop window around (cx, cy).
 
-    Returns (crop, point_inside_crop, was_clamped).
+    Returns (x0, y0, win_x, win_y, was_clamped) — the SAME math as
+    ``render_crop``; used by callers that need the window ORIGIN (e.g. the
+    two-click µm measurement, which converts fragment clicks back into
+    full-res panorama pixels) in addition to the crop itself.
     """
-    H, W = img_rgb.shape[:2]
     half = max(1, int(round(half_px)))
     win_x = min(2 * half, W)
     win_y = min(2 * half, H)
@@ -1383,8 +1445,117 @@ def render_crop(img_rgb: np.ndarray,
         or x0 < 0 or y0 < 0 or x0 + win_x > W or y0 + win_y > H
     x0 = max(0, min(W - win_x, x0))
     y0 = max(0, min(H - win_y, y0))
+    return x0, y0, win_x, win_y, bool(clamped)
+
+
+def render_crop(img_rgb: np.ndarray,
+                cx: float,
+                cy: float,
+                half_px: float) -> Tuple[np.ndarray, Tuple[float, float], bool]:
+    """Crop a (2*half)^2 window around (cx, cy), clamped to the image.
+
+    Returns (crop, point_inside_crop, was_clamped).
+    """
+    H, W = img_rgb.shape[:2]
+    x0, y0, win_x, win_y, clamped = _crop_window(H, W, cx, cy, half_px)
     crop = img_rgb[y0:y0 + win_y, x0:x0 + win_x].copy()
     return crop, (cx - x0, cy - y0), bool(clamped)
+
+
+# Two-click µm measurement (operator request: "click two pixels on the x100
+# fragment and get the distance between them in µm"). Shared drawing style:
+# cyan markers/line — the SAME colour the HTML report's measurement uses.
+_MEAS_COLOR_RGB = (0, 188, 212)          # cyan
+
+
+def _draw_measure_overlay(img_rgb: np.ndarray,
+                          pts_crop: List[Tuple[float, float]],
+                          px_per_um: float,
+                          ) -> Tuple[np.ndarray, Optional[float]]:
+    """Draw the two-click distance measurement ON the fragment.
+
+    ``pts_crop`` — 0/1/2 clicked points in FRAGMENT (crop) coordinates;
+    points outside the fragment are simply not drawn. Returns
+    (image, distance_um_or_None) — the distance is computed from the
+    PASSED points (full-res geometry), independent of what is visible.
+    """
+    out = img_rgb.copy()
+    dist = None
+    if len(pts_crop) >= 2 and px_per_um and px_per_um > 0:
+        a, b = pts_crop[0], pts_crop[1]
+        dist = math.hypot(b[0] - a[0], b[1] - a[1]) / float(px_per_um)
+    H, W = out.shape[:2]
+    vis = []
+    for p in pts_crop:
+        px, py = float(p[0]), float(p[1])
+        if -0.5 <= px < W and -0.5 <= py < H:
+            vis.append((px, py))
+            cv2.circle(out, (int(round(px)), int(round(py))), 8,
+                       _MEAS_COLOR_RGB, 2, cv2.LINE_AA)
+            cv2.drawMarker(out, (int(round(px)), int(round(py))),
+                           _MEAS_COLOR_RGB, cv2.MARKER_CROSS, 17, 2,
+                           cv2.LINE_AA)
+    if len(pts_crop) >= 2 and dist is not None and len(vis) == 2:
+        (ax, ay), (bx, by) = vis
+        cv2.line(out, (int(round(ax)), int(round(ay))),
+                 (int(round(bx)), int(round(by))),
+                 _MEAS_COLOR_RGB, 2, cv2.LINE_AA)
+        label = f"{dist:.2f} \u00b5m"
+        try:
+            from PIL import Image, ImageDraw
+            fs = max(13, min(24, int(W / 60)))
+            img = Image.fromarray(out)
+            dr = ImageDraw.Draw(img)
+            font = _ui_font(fs)
+            bbox = font.getbbox(label)
+            tw_, th_ = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            mx = int(round((ax + bx) / 2))
+            my = int(round((ay + by) / 2))
+            # plate above the midpoint, clamped into the fragment
+            px0 = max(2, min(W - tw_ - 12, mx - tw_ // 2 - 6))
+            py0 = max(2, min(H - th_ - 12, my - th_ - 14))
+            dr.rectangle([px0 - 4, py0 - 4, px0 + tw_ + 8, py0 + th_ + 6],
+                         fill=(0, 0, 0))
+            dr.text((px0, py0), label, fill=_MEAS_COLOR_RGB, font=font)
+            out = np.array(img)
+        except Exception:
+            cv2.putText(out, label.replace("\u00b5", "u"),
+                        (int((ax + bx) / 2), int((ay + by) / 2) - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        _MEAS_COLOR_RGB, 2, cv2.LINE_AA)
+    return out, dist
+
+
+def _center_fragment_preview(img_rgb: np.ndarray,
+                             glass_top: bool,
+                             px_per_um: Optional[float] = None,
+                             display_w: int = 880) -> np.ndarray:
+    """Fragment from the MIDDLE of the x100 panorama with the GLASS / IC
+    side plates (operator request for the glass-side radio: "provide a
+    fragment of the x100 panorama from its middle — choosing glass vs IC
+    becomes a visual decision, not a guess").
+
+    The window is centred, spans the full specimen thickness when the
+    panorama is a wide strip (win_y clamps to H) and up to ~1800 px of
+    its length; it is downscaled to ``display_w`` CSS px for display.
+    An optional true-µm scale bar (bottom-left) plus the side plates
+    (top/bottom edges, centred) are drawn on top.
+    """
+    H, W = img_rgb.shape[:2]
+    half = min(H, W // 2, 900)
+    win_x = min(2 * half, W)
+    win_y = min(2 * half, H)
+    x0 = max(0, (W - win_x) // 2)
+    y0 = max(0, (H - win_y) // 2)
+    crop = img_rgb[y0:y0 + win_y, x0:x0 + win_x].copy()
+    s = min(1.0, float(display_w) / max(1, win_x))
+    if s < 1.0:
+        crop = cv2.resize(crop, (max(1, int(round(win_x * s))),
+                                 max(1, int(round(win_y * s)))),
+                          interpolation=cv2.INTER_AREA)
+    if px_per_um and px_per_um > 0:
+        crop = _draw_scale_bar(crop, float(px_per_um))
+    return _draw_side_labels(crop, glass_top=glass_top)
 
 
 _SCALE_BAR_CANDIDATES_UM = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
@@ -1607,10 +1778,59 @@ def _draw_side_labels(img_rgb: np.ndarray,
 # HTML report
 # ---------------------------------------------------------------------------
 
+# Hard limit of the JPEG format / libjpeg: an image side may not exceed
+# 65500 pixels. cv2.imencode(".jpg", ...) returns ok=False beyond it —
+# the direct cause of the operator's "Report generation failed: JPEG
+# encoding failed" (the x100 panorama is ~99 000 px wide and the report
+# tried to embed it at FULL resolution). Any embed is therefore capped at
+# this side; a wider source is downscaled to it automatically. PNG has no
+# such limit (see _encode_png_rgb).
+_JPEG_MAX_SIDE = 65500
+
+
+def _encode_png_rgb(img_rgb: np.ndarray) -> Optional[bytes]:
+    """PNG-encode an RGB uint8 image of ANY size; None on failure.
+
+    Tries Pillow first (ships with Streamlit): it encodes the RGB array
+    directly, WITHOUT the extra full-size BGR copy that
+    ``cv2.cvtColor(RGB2BGR) + cv2.imencode`` makes — on a ~100 000 px wide
+    x100 panorama that copy alone is ~0.5 GB, which on a small-RAM machine
+    contributed to the PNG downloads silently failing. Falls back to
+    OpenCV (with the copy) when Pillow is unavailable.
+    """
+    if img_rgb is None or img_rgb.size == 0:
+        return None
+    try:
+        import io as _io
+        from PIL import Image
+        bio = _io.BytesIO()
+        Image.fromarray(img_rgb).save(bio, format="PNG", compress_level=6)
+        data = bio.getvalue()
+        if data:
+            return data
+    except Exception:
+        pass
+    try:
+        ok, buf = cv2.imencode(
+            ".png", cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None
+
+
 def _embed_jpeg(img_rgb: np.ndarray, max_side: float,
                 quality: int) -> Tuple[str, float]:
-    """Encode a downscaled JPEG -> (base64, full->embed scale factor)."""
+    """Encode a downscaled JPEG -> (base64, full->embed scale factor).
+
+    ``max_side`` is capped at ``_JPEG_MAX_SIDE`` (65500 px — the hard
+    limit of the JPEG format): a wider source is downscaled to the cap
+    instead of failing the whole report with "JPEG encoding failed".
+    """
+    if img_rgb is None or img_rgb.size == 0 or img_rgb.ndim != 3:
+        raise RuntimeError(
+            "the panorama image is empty or has an unexpected format")
     h, w = img_rgb.shape[:2]
+    max_side = min(float(max_side), float(_JPEG_MAX_SIDE))
     scale = 1.0
     img = img_rgb
     if max(h, w) > max_side:
@@ -1776,6 +1996,11 @@ _HTML_TEMPLATE = Template(r"""<!DOCTYPE html>
      zooms in), and the scale bar inside the fragment always reads
      true µm. */
   #cropscroll { overflow-x: auto; margin: 0 0 8px 0; }
+  #measure { font-size: 14px; margin: 8px 0; min-height: 20px;
+             color: #006064; }
+  #measure b { color: #00707d; }
+  #fnav button.mclr { background: #6b7280; }
+  #fnav button.mclr:hover { background: #575b63; }
   #fnav { margin: 6px 0; font-size: 14px; }
   #fnav button { padding: 6px 12px; margin-right: 6px; background: #1f6feb;
                  color: #fff; border: 0; border-radius: 6px; cursor: pointer;
@@ -1832,10 +2057,13 @@ $SIDENOTE
   <button id="mvL" title="One step towards tie point 1">&#9664; Left</button>
   <button id="mvR" title="One step towards tie point 2">Right &#9654;</button>
   <button id="mvHome" title="Back to the last clicked point">&#10226; Clicked point</button>
+  <button id="mClear" class="mclr" title="Remove the A/B markers and the distance readout">&#10005; Clear measure</button>
   <label>Step (µm) <input id="stepUm" type="number" value="50" min="0.1" step="10"></label>
   <span id="posinfo"></span>
 </div>
 <div id="cropscroll"><canvas id="crop"></canvas></div>
+<div id="measure">Click twice on the fragment to measure the distance between
+the two pixels in µm (uses the x100 calibration).</div>
 <div id="fdl">Download the fragment CURRENTLY shown above (with the GLASS /
 IC labels and the scale bar, WITHOUT the crosshair — the file name carries
 the fragment centre coordinates):
@@ -1856,9 +2084,9 @@ the x10 panorama above recentres it. The Left / Right buttons shift the
 fragment along the edge-to-edge line by the chosen step in µm.</div>
 
 <h2>3 · Downloads</h2>
-<a class="btn" download="$DL10" href="data:image/jpeg;base64,$DIMG10">Download
+<a class="btn" id="dl10" download="$DL10" href="data:image/jpeg;base64,$DIMG10">Download
 x10 panorama (JPEG, full resolution)</a>
-<a class="btn" download="$DL100" href="data:image/jpeg;base64,$DIMG100">Download
+<a class="btn" id="dl100" download="$DL100" href="data:image/jpeg;base64,$DIMG100">Download
 x100 panorama (JPEG, full resolution)</a>
 <div class="hint">$DLNOTE</div>
 
@@ -1886,6 +2114,13 @@ $METADATA
   img100.src = "data:image/jpeg;base64,$IMG100";
 
   function init() {
+    // Download links whose embedded copy was omitted (identical to the
+    // interactive copy when the source exceeds the JPEG size limit — the
+    // base64 block is stored once): fill them from the interactive image.
+    var dl10 = document.getElementById("dl10");
+    var dl100 = document.getElementById("dl100");
+    if (dl10 && dl10.getAttribute("href").length <= 26) dl10.href = img10.src;
+    if (dl100 && dl100.getAttribute("href").length <= 26) dl100.href = img100.src;
     var c10 = document.getElementById("c10");
     var o10 = document.getElementById("o10");
     c10.width = img10.naturalWidth; c10.height = img10.naturalHeight;
@@ -1912,6 +2147,26 @@ $METADATA
       "click", function () { downloadFragment("png"); });
     document.getElementById("dlJpg").addEventListener(
       "click", function () { downloadFragment("jpeg"); });
+    // Two-click µm measurement: every click on the fragment toggles the
+    // A → B pair (full-res coordinates are stored, so the markers and the
+    // line survive moving the fragment with the Left / Right buttons).
+    var ccrop = document.getElementById("crop");
+    ccrop.addEventListener("click", function (e) {
+      if (!CUR) return;
+      var rect = ccrop.getBoundingClientRect();
+      var ex = (e.clientX - rect.left) * (ccrop.width / rect.width);
+      var ey = (e.clientY - rect.top) * (ccrop.height / rect.height);
+      var fpx = CUR.wx0 + ex / CUR.cscale;      // canvas px -> full-res x100
+      var fpy = CUR.wy0 + ey / CUR.cscale;
+      if (measPts.length >= 2) measPts = [];    // third click: new pair
+      measPts.push([fpx, fpy]);
+      showFragment(curQ[0], curQ[1]);
+    });
+    document.getElementById("mClear").addEventListener(
+      "click", function () {
+        measPts = [];
+        showFragment(curQ[0], curQ[1]);
+      });
     // The report opens with the fragment at the MIDDLE of the segment
     // between the two disk-edge tie points (or at the centre of the x100
     // panorama when fewer than two tie points exist).
@@ -1971,6 +2226,80 @@ $METADATA
                             // (window, scale, bar, plates) — reused by the
                             // download buttons so the saved image is the
                             // fragment EXACTLY as shown on screen
+
+  // ---- two-click µm measurement on the fragment (operator request: click
+  // two pixels and read the distance between them in µm) -------------------
+  var measPts = [];         // 0/1/2 clicked points, FULL-RES x100 px
+  var MEASCOL = "#00bcd4";  // cyan — the same colour the app's live
+                            // preview draws the measurement with
+  function drawMeasure(ctx, P) {
+    var mi2 = document.getElementById("measure");
+    if (!measPts.length) {
+      mi2.textContent = "Click twice on the fragment to measure the " +
+        "distance between the two pixels in µm (uses the x100 " +
+        "calibration). The markers and the line survive moving the " +
+        "fragment; a third click starts a new measurement.";
+      return;
+    }
+    var cvPts = [], distUm = null, pxLen = 0;
+    if (measPts.length >= 2) {
+      var ddx = measPts[1][0] - measPts[0][0];
+      var ddy = measPts[1][1] - measPts[0][1];
+      pxLen = Math.sqrt(ddx * ddx + ddy * ddy);
+      distUm = pxLen / PXUM100;
+    }
+    ctx.font = "bold 12px sans-serif";
+    for (var mi = 0; mi < measPts.length; mi++) {
+      var mx = (measPts[mi][0] - P.wx0) * P.cscale;
+      var my = (measPts[mi][1] - P.wy0) * P.cscale;
+      cvPts.push([mx, my]);
+      if (mx < -20 || my < -20 || mx > P.cw + 20 || my > P.ch + 20) {
+        continue;                        // outside the shown fragment
+      }
+      ctx.strokeStyle = MEASCOL; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(mx, my, 7, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(mx - 12, my); ctx.lineTo(mx + 12, my);
+      ctx.moveTo(mx, my - 12); ctx.lineTo(mx, my + 12); ctx.stroke();
+      ctx.fillStyle = MEASCOL;
+      ctx.fillText(mi === 0 ? "A" : "B", mx + 10, my - 10);
+    }
+    if (measPts.length >= 2) {
+      var ax = cvPts[0][0], ay = cvPts[0][1];
+      var bx = cvPts[1][0], by = cvPts[1][1];
+      var inA = !(ax < -20 || ay < -20 || ax > P.cw + 20 || ay > P.ch + 20);
+      var inB = !(bx < -20 || by < -20 || bx > P.cw + 20 || by > P.ch + 20);
+      if (inA && inB) {
+        ctx.strokeStyle = MEASCOL; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+        var mx2 = (ax + bx) / 2, my2 = (ay + by) / 2;
+        var lbl = distUm.toFixed(2) + " µm";
+        ctx.font = "bold 13px sans-serif";
+        var tw2 = ctx.measureText(lbl).width;
+        ctx.fillStyle = "rgba(0,0,0,0.75)";
+        ctx.fillRect(mx2 - tw2 / 2 - 5, my2 - 24, tw2 + 10, 19);
+        ctx.fillStyle = MEASCOL;
+        ctx.fillText(lbl, mx2 - tw2 / 2, my2 - 10);
+      }
+      var off = 0;
+      for (var mo = 0; mo < 2; mo++) {
+        if (measPts[mo][0] < P.wx0 || measPts[mo][0] > P.wx0 + P.winW ||
+            measPts[mo][1] < P.wy0 || measPts[mo][1] > P.wy0 + P.winH) off++;
+      }
+      mi2.innerHTML = "<b>Distance A → B: " + distUm.toFixed(2) + " µm</b> (" +
+        Math.round(pxLen) + " px at the x100 panorama's full resolution) · " +
+        "A(" + Math.round(measPts[0][0]) + ", " + Math.round(measPts[0][1]) +
+        ") · B(" + Math.round(measPts[1][0]) + ", " +
+        Math.round(measPts[1][1]) + ")" +
+        (off ? " · " + off + " point(s) OUTSIDE the currently shown " +
+          "fragment (the view moved) — the distance stays valid" : "") +
+        " — click again to start a new measurement.";
+    } else {
+      mi2.innerHTML = "A(" + Math.round(measPts[0][0]) + ", " +
+        Math.round(measPts[0][1]) + ") px placed — click once more for " +
+        "point B (the distance is shown in µm).";
+    }
+  }
 
   // ---- shared fragment drawing helpers ----------------------------------
   // The on-screen fragment and the downloaded PNG / JPEG are built with
@@ -2158,6 +2487,7 @@ $METADATA
     ctx.strokeRect(px - 9, py - 9, 18, 18);
     drawScaleBar(ctx, P);
     drawSidePlates(ctx, P);
+    drawMeasure(ctx, P);
 
     // Crosshair on the x10 panorama: back-map the (possibly button-moved)
     // fragment centre so the marker follows the navigation too.
@@ -2293,7 +2623,13 @@ def generate_html_report(img10_rgb: np.ndarray,
                               fragment shown on a click is cut from THIS
                               copy and drawn without upscaling, so its
                               quality is bounded by this resolution —
-                              full resolution = pixel-perfect fragment;
+                              full resolution = pixel-perfect fragment.
+                              BOTH sides are capped at 65500 px (the hard
+                              JPEG format limit): a wider x100 panorama
+                              is embedded at 65500 px automatically
+                              (fragments stay near-native) instead of
+                              failing the whole report; the report notes
+                              the downscaling in the downloads section;
     ``dl_full_resolution``  — embed ADDITIONAL full-resolution JPEG
                               copies (quality ``dl_jpeg_quality``) used
                               by the two Download buttons, so the
@@ -2313,9 +2649,24 @@ def generate_html_report(img10_rgb: np.ndarray,
                  if (embed_max_side_x100 and embed_max_side_x100 > 0)
                  else 10 ** 9)
     b64_100, f100 = _embed_jpeg(img100_rgb, x100_side, jpeg_quality)
+    # "Full-resolution" download copies: capped by the JPEG format limit
+    # (65500 px per side) inside _embed_jpeg. When the interactive copy of
+    # an image ALREADY sits at that cap (a panorama wider than 65500 px,
+    # e.g. the operator's ~99 000 px x100), the two copies are identical —
+    # reuse it instead of embedding a second multi-megabyte copy.
     if dl_full_resolution:
-        b64_10d, _ = _embed_jpeg(img10_rgb, 10 ** 9, dl_jpeg_quality)
-        b64_100d, _ = _embed_jpeg(img100_rgb, 10 ** 9, dl_jpeg_quality)
+        dl_side = float(_JPEG_MAX_SIDE)
+        int10 = max(img10_rgb.shape[:2]) / max(f10, 1e-9) if f10 else 10 ** 9
+        int100 = (max(img100_rgb.shape[:2]) / max(f100, 1e-9)
+                  if f100 else 10 ** 9)
+        # An empty sentinel string = "identical to the interactive copy":
+        # the template emits an empty href and the report's JavaScript
+        # fills it from the interactive image at load time — the huge
+        # base64 block is stored ONCE instead of twice.
+        b64_10d = ("" if int10 > dl_side
+                   else _embed_jpeg(img10_rgb, 10 ** 9, dl_jpeg_quality)[0])
+        b64_100d = ("" if int100 > dl_side
+                    else _embed_jpeg(img100_rgb, 10 ** 9, dl_jpeg_quality)[0])
         dl_note = ("These links download the FULL-resolution copies "
                    "embedded in this file (JPEG, quality "
                    f"{dl_jpeg_quality:g}) — the interactive images above "
@@ -2329,6 +2680,25 @@ def generate_html_report(img10_rgb: np.ndarray,
                    "downloads). Full-resolution panoramas are also "
                    "available in the application (Cross-section Map tab "
                    "→ section 5).")
+    # Transparent note when a panorama exceeded the JPEG format limit and
+    # was downscaled for the embeds (the operator's "JPEG encoding failed"
+    # report — the x100 panorama is ~99 000 px wide).
+    _over = []
+    if max(img10_rgb.shape[:2]) > _JPEG_MAX_SIDE:
+        _over.append(f"x10 ({img10_rgb.shape[1]}×{img10_rgb.shape[0]} px)")
+    if max(img100_rgb.shape[:2]) > _JPEG_MAX_SIDE:
+        _over.append(
+            f"x100 ({img100_rgb.shape[1]}×{img100_rgb.shape[0]} px)")
+    if _over:
+        dl_note += (
+            " NOTE: the " + " and the ".join(_over) +
+            " exceed the JPEG format limit of 65500 px per side, so the "
+            "embedded interactive copy and the download link of that "
+            "panorama share ONE downscaled-to-65500-px copy (stored "
+            "once, linked by the report's script — no duplicate is "
+            "embedded). The UNTOUCHED full-resolution panorama is "
+            "available in the application: Cross-section Map → section "
+            "5 → 'Prepare PNG downloads' (PNG has no size limit).")
     if not cal100.ok:
         raise ValueError("x100 calibration missing")
     crop_half_um = fov_um / 2.0 + (k * sigma_um if sigma_um else 0.0)
@@ -2616,13 +2986,17 @@ def _tie_zoom_pick_block(img_full: np.ndarray,
     panorama pixel. Returns None while the refining click has not
     happened yet.
 
-    The crop is taken at FULL panorama resolution, enlarged x
-    ``TIE_ZOOM_FACTOR`` with nearest-neighbour interpolation (real pixels
-    stay crisp, not smeared), drawn with a red crosshair + orange box at
-    the first-click position. Click -> full-res mapping stays exact even
-    when the widget displays the fragment at a different size than its
-    natural pixels: _click_preview_scaled rescales the click by the
-    reported displayed size, and the crop origin is added here.
+    The crop is taken at FULL panorama resolution, enlarged with
+    nearest-neighbour interpolation (real pixels stay crisp, not smeared)
+    by an ADAPTIVE factor so the enlarged fragment is rendered at about
+    ``TIE_ZOOM_DISPLAY_WIDTH`` CSS px (f = display width / window side,
+    clamped to 1.0…4.0 — a big 760 px window gets a moderate ~1.7x zoom,
+    a small window clamped at the panorama border gets a higher one),
+    drawn with a red crosshair + orange box at the first-click position.
+    Click -> full-res mapping stays exact even when the widget displays
+    the fragment at a different size than its natural pixels:
+    _click_preview_scaled rescales the click by the reported displayed
+    size, and the crop origin is added here.
     """
     ih, iw = img_full.shape[:2]
     cx = float(centre_full[0])
@@ -2647,7 +3021,10 @@ def _tie_zoom_pick_block(img_full: np.ndarray,
              (255, 40, 40), 1)
     cv2.rectangle(crop, (px - 10, py - 10), (px + 10, py + 10),
                   (255, 150, 0), 1)
-    f = float(TIE_ZOOM_FACTOR)
+    # Adaptive nearest-neighbour zoom: the enlarged fragment should be
+    # about TIE_ZOOM_DISPLAY_WIDTH CSS px wide (see the constants block).
+    f = max(1.0, min(4.0, float(TIE_ZOOM_DISPLAY_WIDTH)
+                     / float(max(cw_, ch_))))
     if f > 1.01:
         crop = cv2.resize(crop, None, fx=f, fy=f,
                           interpolation=cv2.INTER_NEAREST)
@@ -3352,7 +3729,10 @@ def _click_trace_bar_block(img_rgb: np.ndarray, key_prefix: str,
                      "below the bar)",
                      key=f"{key_prefix}_ocr", disabled=not _HAS_PYTESSERACT,
                      help=("Runs tesseract on the label windows ABOVE and "
-                           "BELOW the traced bar. The label pixels are "
+                           "BELOW the traced bar (they grow TALLER and "
+                           "WIDER automatically while no trustworthy "
+                           "value is found, so a label far from the bar "
+                           "is captured too). The label pixels are "
                            "ISOLATED BY THE BAR'S COLOUR first (the label "
                            "is drawn in the same colour as the bar), every "
                            "reading is ranked, and only a trustworthy value "
@@ -3913,7 +4293,8 @@ def render_map_tab() -> None:
     # the other panorama stays fully visible after EVERY click.
     tie_epoch = (f"~z10{int(zs.get('10') is not None)}"
                  f"~z100{int(zs.get('100') is not None)}"
-                 f"~np{len(pairs)}")
+                 f"~np{len(pairs)}"
+                 f"~rp{int(st.session_state.get('xmap_tie_restore', 0))}")
 
     def _tie_pick_flow(img_full: np.ndarray,
                        marker_points: List[Tuple[float, float]],
@@ -3931,11 +4312,21 @@ def render_map_tab() -> None:
         ``ck_key`` / ``zoom_key`` arrive with the structural epoch
         already appended (see tie_epoch above) so the OTHER panorama's
         widget remounts WITH fresh data whenever the magnifier of THIS
-        panorama opens or closes."""
+        panorama opens or closes.
+
+        The whole-panorama preview uses the EXPLICIT NUMERIC display
+        sizing (TIE_PREVIEW_DISPLAY_WIDTH, allow_upscale=True) instead of
+        the CSS stretch mode — a constant frame height is sent from
+        Python on every mount/rerun, so a preview re-mounted while the
+        magnifier structure changes can never render cut-off or blank
+        (part of the fix of the operator's 'the panoramas disappear on
+        clicking' report)."""
         st.markdown(title)
         marked, s_marked = _marked_preview(img_full, PREVIEW_SIDE_MAIN,
                                            marker_points, zs.get(side))
-        click = _click_preview_scaled(marked, ck_key, s_marked)
+        click = _click_preview_scaled(
+            marked, ck_key, s_marked,
+            display_width=TIE_PREVIEW_DISPLAY_WIDTH, allow_upscale=True)
         if click is not None:
             zs[side] = (float(click[0]), float(click[1]))
             st.rerun()      # rebuild the preview with the pending marker
@@ -3985,6 +4376,26 @@ def render_map_tab() -> None:
                           key="xmap_tie100_x")
     qy = cc4.number_input("x100 · y", min_value=0.0, step=1.0,
                           key="xmap_tie100_y")
+
+    # Belt-and-braces escape hatch for the 'the panoramas disappear on
+    # clicking' report (extends the structural epoch above): ANY blank /
+    # unresponsive preview can be restored with one click. The button
+    # bumps the epoch, BOTH preview widget keys change, Streamlit mounts
+    # them as NEW elements and delivers their image data — a stale or
+    # empty component iframe gets replaced by a fresh one no matter what
+    # caused it (a browser-discarded iframe under memory pressure, a
+    # remount race, ...). Also useful after the browser tab was restored.
+    rb1, rb2, _rb3 = st.columns([2, 1, 3])
+    if rb2.button("Previews blank / not clickable? — Restore",
+                  key="xmap_tie_restore_btn",
+                  help="Re-mounts both panorama previews with fresh "
+                       "widget keys. Use it if a preview ever shows up "
+                       "blank or ignores clicks (e.g. after switching "
+                       "browser tabs on a low-memory machine). Nothing "
+                       "else changes — picked points are kept."):
+        st.session_state["xmap_tie_restore"] = (
+            int(st.session_state.get("xmap_tie_restore", 0)) + 1)
+        st.rerun()
 
     abtn, dbtn, _ = st.columns([1, 1, 2])
     can_add = (st.session_state.get("xmap_tie10_x") and
@@ -4183,6 +4594,26 @@ def render_map_tab() -> None:
          "Top — IC · Bottom — GLASS"],
         index=0, key="xmap_glass_side_tb", horizontal=True)
     glass_top = glass_choice.startswith("Top — GLASS")
+    # Visual aid (operator request: "provide a fragment of the x100
+    # panorama from its MIDDLE, so choosing glass vs IC is easier"): the
+    # coloured plates show the CURRENT choice and flip instantly with the
+    # radio. The fragment spans the full specimen thickness (top and
+    # bottom edges of the panorama) plus a true-µm scale bar.
+    try:
+        _cf = _center_fragment_preview(
+            item100["image"], glass_top=glass_top,
+            px_per_um=(cal100.px_per_um if cal100.ok else None))
+        st.image(_cf, use_container_width=True)
+        st.caption(
+            "A fragment from the MIDDLE of the x100 panorama — the full "
+            "thickness is visible, so the glass side (even, glassy "
+            "appearance) and the IC side (the device structure) can be "
+            "told apart directly. The coloured plates are your CURRENT "
+            "choice above — switch the radio and they flip immediately. "
+            "The same plates are drawn on every x100 fragment in the live "
+            "preview and in the HTML report.")
+    except Exception as e:
+        st.caption(f"(Center-fragment preview unavailable: {e})")
     fov_um = st.number_input("Field of view around the point (µm)",
                              min_value=1.0, value=DEFAULT_FOV_UM,
                              step=10.0, key="xmap_fov")
@@ -4228,10 +4659,60 @@ def render_map_tab() -> None:
     # Side plates (GLASS / IC) on the fragment — the operator's choice
     # from the radio above travels into the HTML report too.
     annotated = _draw_side_labels(annotated, glass_top=glass_top)
+    # --- Two-click µm measurement on the x100 fragment (operator request:
+    # click two pixels and read the distance between them in µm, using the
+    # x100 calibration). The clicks are stored in FULL-RES x100 coordinates
+    # (so the measurement survives moving the view) and drawn as cyan
+    # markers A/B + line + label — the SAME style the HTML report uses.
+    _meas_entry = state.setdefault("live_measure", {})
+    if _meas_entry.get("pan") != item100["name"]:
+        state["live_measure"] = {"pan": item100["name"], "pts": []}
+        _meas_entry = state["live_measure"]
+    meas = _meas_entry["pts"]
+    _x0c, _y0c, _wxc, _wyc, _clc = _crop_window(
+        *item100["image"].shape[:2], qx, qy, half_full)
+    annotated, meas_dist = _draw_measure_overlay(
+        annotated,
+        [(p[0] - _x0c, p[1] - _y0c) for p in meas],
+        cal100.px_per_um)
     # Only the x100 fragment is shown here — the x10 panorama with the
     # crosshair is ALREADY displayed above (the clickable preview); the
     # old second copy next to the fragment was a duplicate and is removed.
-    st.image(annotated, use_container_width=True)
+    # The fragment is CLICKABLE (two-click µm measurement).
+    meas_click = _click_preview_scaled(annotated, "xmap_ck_meas", 1.0)
+    if meas_click is not None:
+        if len(meas) >= 2:
+            meas.clear()                 # third click starts a new pair
+        meas.append((float(meas_click[0] + _x0c),
+                     float(meas_click[1] + _y0c)))
+        st.rerun()
+    mc1, mc2, _mc3 = st.columns([1, 1, 3])
+    if mc1.button("Clear measurement", key="xmap_meas_clear",
+                  help="Removes the A/B markers and the distance readout."):
+        meas.clear()
+        st.rerun()
+    if meas_dist is not None:
+        px_len = math.hypot(meas[1][0] - meas[0][0],
+                            meas[1][1] - meas[0][1])
+        offcrop = sum(1 for p in meas
+                      if not (_x0c <= p[0] < _x0c + _wxc
+                              and _y0c <= p[1] < _y0c + _wyc))
+        st.success(
+            f"Distance A → B: **{meas_dist:.2f} µm** "
+            f"({px_len:.1f} px on the x100 panorama). Click again to "
+            "start a new measurement — the previous one is replaced.")
+        if offcrop:
+            st.caption(f"{offcrop} of the 2 measured points lie OUTSIDE "
+                       "the currently shown fragment (the view moved) — "
+                       "the distance above stays valid.")
+    elif len(meas) == 1:
+        st.caption("Point A placed — click the fragment once more to "
+                   "measure the distance to point B (µm).")
+    else:
+        st.caption("Click TWICE on the fragment to measure the distance "
+                   "between the two pixels in µm (uses the x100 "
+                   "calibration; the third click starts a new "
+                   "measurement).")
     st.caption(f"Clicked x10: ({pt[0]:.0f}, {pt[1]:.0f}) px → "
                f"mapped x100: ({qx:.0f}, {qy:.0f}) px")
     tie_dist_um = _nearest_tie_dist_um(pt, pairs, cal10)
@@ -4271,6 +4752,13 @@ def render_map_tab() -> None:
               "report — the fragment that appears on a click is cut "
               "from THIS copy and drawn WITHOUT upscaling, so 0 (full "
               "resolution) gives the best fragment quality."))
+    st.caption(
+        "0 = full resolution, capped at **65500 px per side — the hard "
+        "limit of the JPEG format**. A wider x100 panorama (e.g. "
+        "~99 000 px) is embedded at 65500 px automatically — this is "
+        "what previously failed as 'Report generation failed: JPEG "
+        "encoding failed'. Lower the value for a smaller report file "
+        "(the fragments get slightly softer).")
     dl_full = st.checkbox(
         "Embed full-resolution copies for the two download buttons "
         "(larger HTML file)", value=True, key="xmap_dl_full",
@@ -4330,21 +4818,36 @@ def render_map_tab() -> None:
             st.rerun()
     with st.expander("Full-resolution downloads (PNG)"):
         st.caption("Encoding large panoramas takes a moment — prepare "
-                   "them on demand.")
+                   "them on demand. PNG has NO size limit (unlike JPEG, "
+                   "which stops at 65500 px per side), so a ~100 000 px "
+                   "wide x100 panorama downloads here at its full "
+                   "resolution; encoding may take a while and needs "
+                   "some free RAM.")
         if st.button("Prepare PNG downloads",
                      key="xmap_prep_png"):
             with st.spinner("Encoding PNG…"):
-                ok10, buf10 = cv2.imencode(
-                    ".png", cv2.cvtColor(item10["image"], cv2.COLOR_RGB2BGR))
-                ok100, buf100 = cv2.imencode(
-                    ".png", cv2.cvtColor(item100["image"],
-                                         cv2.COLOR_RGB2BGR))
+                buf10b = _encode_png_rgb(item10["image"])
+                buf100b = _encode_png_rgb(item100["image"])
                 st.session_state["xmap_png10"] = (
-                    item10["name"], buf10.tobytes() if ok10 else None)
+                    item10["name"], buf10b)
                 st.session_state["xmap_png100"] = (
-                    item100["name"], buf100.tobytes() if ok100 else None)
+                    item100["name"], buf100b)
+                if buf100b is not None:
+                    st.caption(f"x100 PNG ready: "
+                               f"{len(buf100b) / 1e6:.1f} MB.")
         png10 = st.session_state.get("xmap_png10")
         png100 = st.session_state.get("xmap_png100")
+        if png10 and png10[0] == item10["name"] and not png10[1]:
+            st.warning("x10 PNG encoding failed — press 'Prepare PNG "
+                       "downloads' again.")
+        if png100 and png100[0] == item100["name"] and not png100[1]:
+            st.error(
+                "x100 PNG encoding failed — most likely the machine ran "
+                "out of free memory while compressing the very wide "
+                "image. Close other programs / tabs and try again; as a "
+                "fallback, the HTML report's 'Download x100 panorama' "
+                "link gives a JPEG at the maximum encodable size "
+                "(65500 px per side).")
         d1, d2 = st.columns(2)
         if png10 and png10[0] == item10["name"] and png10[1]:
             d1.download_button("Download x10 panorama (PNG)",

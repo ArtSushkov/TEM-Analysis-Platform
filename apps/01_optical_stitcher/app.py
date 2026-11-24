@@ -6,6 +6,7 @@ Run:
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import os
@@ -13,7 +14,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -76,6 +77,27 @@ st.markdown(
 # the uploader widgets stopped rendering. The always-on sidebar fixes both.
 
 NAV_TABS = ["Stitcher", "Pair Review", "Cross-section Map", "Help"]
+
+# Shared text for both MemoryError handlers (Stitcher and Pair Review).
+# Since the low-RAM slabbed blend (blending.py) the canvas float32 arrays
+# are never allocated at full panorama size, so an OOM here means the whole
+# SERIES does not fit in the FREE memory — the advice focuses on freeing
+# RAM and shrinking the series, not on canvas internals.
+_RAM_HELP_TEXT = (
+    "Even in the automatic low-RAM blending mode the series does not fit "
+    "in the FREE memory of this machine. What helps (in order of effect):\n"
+    "1. close other Streamlit tabs / heavy programs (browser windows, "
+    "image viewers) — the RAM they occupy is what the stitcher is missing;\n"
+    "2. stitch a SHORTER row (fewer tiles) at a time, then stitch the "
+    "next portion;\n"
+    "3. keep the ROI band ON (it crops every tile to the disk band before "
+    "stitching — it is ON by default);\n"
+    "4. switch 'Also keep full panorama (debug)' OFF in the ROI expander "
+    "(it stores a second, full-height panorama in RAM);\n"
+    "5. the lossless TIFF repack shrinks the FILES on disk, not the RAM "
+    "footprint — decoded pixels always occupy their full size while the "
+    "tiles stay loaded."
+)
 
 
 def _render_navigation() -> str:
@@ -315,7 +337,12 @@ def _roi_overlay_cached(sig_hash, k, image, band, out_width):
     if out is None:
         out = pair_review.render_tile_with_roi_overlay(
             image, band, out_width=out_width)
-        if len(cache) >= 128:
+        if len(cache) >= 24:
+            # MEMORY: the overlays are full-width preview frames; 128
+            # cached entries could hold hundreds of MB of RAM (operator
+            # report: out-of-memory during stitching). 24 entries still
+            # cover a whole 10-20-tile row of stable previews; beyond
+            # that the cache is simply rebuilt on demand.
             cache.clear()
         cache[ckey] = out
     return out
@@ -557,6 +584,37 @@ def _current_upload_signature():
     return ("files", tuple((f.name, f.size) for f in files))
 
 
+def _render_repack_notes():
+    """Report the auto lossless TIFF repack of the current upload.
+
+    Rendered by ``_get_tiles_cached`` (Stitcher AND Pair Review tabs) on
+    every rerun while the upload stays the same, so the operator keeps
+    seeing the report after interacting with any widget.
+    """
+    notes = st.session_state.get("repack_notes") or []
+    if not notes:
+        return
+    repacked = [n for n in notes if n.get("repacked")]
+    if repacked:
+        lines = [
+            f"**{n['name']}**: {n['orig'] / 1e6:.2f} MB \u2192 "
+            f"{n['final'] / 1e6:.2f} MB" for n in repacked]
+        st.info(
+            "TIFF file(s) above the 5.7 MB upload target were repacked "
+            "LOSSLESSLY (Deflate + horizontal predictor; every pixel is "
+            "bit-for-bit identical, scale-bar metadata kept): "
+            + "; ".join(lines))
+    for n in notes:
+        if n.get("target_met"):
+            continue
+        reason = n.get("msg") or ""
+        st.warning(
+            f"**{n['name']}** stayed ABOVE the 5.7 MB target "
+            f"({n['orig'] / 1e6:.2f} MB \u2192 {n['final'] / 1e6:.2f} MB). "
+            f"{reason} The workflow continues with this file \u2014 only "
+            "the size target is not met, nothing is blocked.")
+
+
 def _get_tiles_cached():
     """Load tiles once per upload, cached in session state.
 
@@ -565,8 +623,10 @@ def _get_tiles_cached():
     """
     sig = _current_upload_signature()
     if sig is None:
+        st.session_state.pop("repack_notes", None)
         return None, None
     if st.session_state.get("tiles_sig") == sig:
+        _render_repack_notes()
         cached = st.session_state.get("tiles_data")
         if isinstance(cached, dict) and cached.get("error"):
             return None, cached["error"]
@@ -583,7 +643,26 @@ def _get_tiles_cached():
             data_dir = Path(tempfile.mkdtemp(prefix="micro_files_"))
             for f in st.session_state["uploaded_files"]:
                 (data_dir / f.name).write_bytes(f.getbuffer())
+        # Operator request: every uploaded TIFF above 5.7 MB is repacked
+        # LOSSLESSLY (Deflate + horizontal predictor) before it enters
+        # the pipeline; files that cannot reach the target produce a
+        # visible operator warning instead. This runs on the temp-dir
+        # copies ONCE per upload — the original UploadedFile bytes are
+        # never modified, and the repacked copies die with the temp dir.
+        try:
+            st.session_state["repack_notes"] = \
+                io_utils.repack_folder_tiffs_above_target(data_dir)
+        except Exception as _rp_err:      # never break the upload flow
+            st.session_state["repack_notes"] = [{
+                "name": "-", "orig": 0, "final": 0, "repacked": False,
+                "target_met": False,
+                "msg": f"auto-repack step failed: {_rp_err}",
+            }]
+        _render_repack_notes()
         tiles = io_utils.load_tiles(data_dir)
+        # Release the TIFF decode temporaries immediately (large series
+        # on small-RAM machines) before the tiles enter the session.
+        gc.collect()
         st.session_state["tiles_sig"] = sig
         st.session_state["tiles_data"] = tiles
         return tiles, None
@@ -643,7 +722,122 @@ def _result_snapshot(result, tiles, source):
     }
 
 
-def _snap_download_bytes(snap, img_bgr, rgb, upload_calib, ext, enc_prefix) \
+# Hard side limit of the JPEG format / libjpeg (65500 px): a wider side
+# cannot be encoded at all — cv2.imencode(".jpg") returns ok=False. The
+# JPEG download of a very wide panorama is downscaled to this cap (the
+# direct cause of the operator's broken empty jpeg; PNG has no such
+# limit and stays full-resolution).
+_JPEG_MAX_SIDE = cross_section_map._JPEG_MAX_SIDE
+
+
+def _pil_encode_bgr(img_bgr: np.ndarray, fmt: str) -> Optional[bytes]:
+    """PNG/JPEG-encode a BGR uint8 array with Pillow, ZERO full-size copies.
+
+    ``Image.frombuffer`` with the raw mode "BGR" shares the numpy buffer
+    directly (Pillow swaps the channels on the fly while encoding), so no
+    ``cv2.cvtColor`` copy of a ~0.5 GB panorama is ever made — on the
+    operator's small-RAM machine that extra copy was enough to push the
+    encoder into allocation failure (the empty downloads of the
+    'Large panorama downloads are empty' bug). Returns None on failure.
+    """
+    try:
+        import io as _io
+        from PIL import Image
+        h, w = img_bgr.shape[:2]
+        pil_img = Image.frombuffer("RGB", (w, h), img_bgr,
+                                   "raw", "BGR", 0, 1)
+        bio = _io.BytesIO()
+        if fmt == "jpg":
+            pil_img.save(bio, format="JPEG", quality=95)
+        else:
+            pil_img.save(bio, format="PNG", compress_level=6)
+        data = bio.getvalue()
+        return data if data else None
+    except Exception:
+        return None
+
+
+def _encode_panorama_download(img_bgr: np.ndarray, ext: str) \
+        -> Tuple[bytes, dict]:
+    """Encode the panorama for the download buttons — NEVER returns a
+    silently empty file without telling the UI why.
+
+    Fixes of the 'the downloaded PNG/JPEG of a very wide panorama has no
+    image' bug, three separate causes:
+
+    1. **JPEG side limit** — the JPEG format itself cannot store a side
+       longer than 65500 px: ``cv2.imencode(".jpg")`` returns ok=False
+       for the ~99 000 px wide x100 panorama and the old code cached the
+       resulting EMPTY bytes (the broken 0-byte jpeg the operator
+       attached). The image is now downscaled to 65500 px first and the
+       UI explains it (PNG remains the full-resolution lossless export).
+    2. **Encoder failure under memory pressure** — encoding a 466 MB
+       panorama with only a few hundred MB of free RAM can fail; the old
+       code cached b"" forever and still rendered the download button.
+       Now a failed encode is retried with Pillow (zero-copy from the
+       BGR buffer), then with a downscaled fallback, and a persistent
+       failure is reported as an st.error instead of an empty download.
+    3. **Avoidable full-size copies** — the old render path made two
+       extra full-size BGR->RGB copies (~0.5 GB each) on EVERY rerun
+       before encoding; they are gone (see render_stitch_result).
+    """
+    info: dict = {}
+    h, w = img_bgr.shape[:2]
+    img = img_bgr
+    if ext == "jpg" and max(h, w) > _JPEG_MAX_SIDE:
+        # JPEG cannot encode beyond 65500 px per side — downscale to the
+        # cap instead of producing an empty file.
+        scale = float(_JPEG_MAX_SIDE) / float(max(h, w))
+        img = cv2.resize(img_bgr,
+                         (max(1, int(round(w * scale))),
+                          max(1, int(round(h * scale)))),
+                         interpolation=cv2.INTER_AREA)
+        info["downscaled"] = True
+        info["scale"] = scale
+        info["out_size"] = (img.shape[1], img.shape[0])
+
+    # Pillow first: zero-copy from the BGR buffer (see _pil_encode_bgr).
+    data = _pil_encode_bgr(img, ext)
+    if data:
+        return data, info
+    # OpenCV fallback (encodes BGR directly, no channel copy needed).
+    try:
+        if ext == "jpg":
+            ok, buf = cv2.imencode(".jpg", img,
+                                   [cv2.IMWRITE_JPEG_QUALITY, 95])
+        else:
+            ok, buf = cv2.imencode(".png", img)
+        if ok:
+            return buf.tobytes(), info
+    except Exception:
+        pass
+    # Last resort ONLY for PNG (the lossless full-res export): a
+    # downscaled encode still gives the operator a usable file.
+    if ext == "png":
+        h2, w2 = img.shape[:2]
+        cap = 32768
+        if max(h2, w2) > cap:
+            s2 = float(cap) / float(max(h2, w2))
+            img2 = cv2.resize(img, (max(1, int(round(w2 * s2))),
+                                    max(1, int(round(h2 * s2)))),
+                              interpolation=cv2.INTER_AREA)
+            data = _pil_encode_bgr(img2, "png") or None
+            if data is None:
+                try:
+                    ok, buf = cv2.imencode(".png", img2)
+                    data = buf.tobytes() if ok else None
+                except Exception:
+                    data = None
+            if data:
+                info["downscaled"] = True
+                info["scale"] = s2
+                info["out_size"] = (img2.shape[1], img2.shape[0])
+                info["fallback"] = True
+                return data, info
+    return b"", {"error": True}
+
+
+def _snap_download_bytes(snap, img_bgr, upload_calib, ext, enc_prefix) \
         -> Tuple[bytes, dict]:
     """Encode a panorama for download, cached INSIDE the snapshot.
 
@@ -651,9 +845,12 @@ def _snap_download_bytes(snap, img_bgr, rgb, upload_calib, ext, enc_prefix) \
     interaction with the tab visibly slower once the result block
     persisted; the cache is keyed by the format AND the calibration
     (recalibrating invalidates the cached download automatically).
-    Returns ``(bytes, info)`` where ``info`` carries encode diagnostics
-    (kept for compatibility; PNG/JPEG have none). The TIFF export was
-    removed at the operator's request — PNG is the lossless export.
+    FAILED encodes are never cached (the operator can just press the
+    button again after freeing RAM — the old code cached the empty
+    result permanently). Returns ``(bytes, info)`` where ``info`` carries
+    encode diagnostics (``downscaled`` / ``scale`` / ``error``). The TIFF
+    export was removed at the operator's request — PNG is the lossless
+    export.
     """
     enc = snap.setdefault("enc_cache", {})
     infos = snap.setdefault("enc_info", {})
@@ -661,14 +858,18 @@ def _snap_download_bytes(snap, img_bgr, rgb, upload_calib, ext, enc_prefix) \
               if (upload_calib is not None and upload_calib.ok) else 0.0)
     ck = f"{enc_prefix}:{ext}:{px_tag:.10g}"
     if ck not in enc:
-        if ext == "png":
-            ok, buf = cv2.imencode(".png", img_bgr)
-            enc[ck] = buf.tobytes() if ok else b""
+        # Keep at most the two most recent encodes per snapshot: for a
+        # ~100 000 px panorama each cached copy is hundreds of MB.
+        while len(enc) >= 2:
+            old_ck = next(iter(enc))
+            enc.pop(old_ck, None)
+            infos.pop(old_ck, None)
+        data, info = _encode_panorama_download(img_bgr, ext)
+        if data:
+            enc[ck] = data
+            infos[ck] = info
         else:
-            ok, buf = cv2.imencode(".jpg", img_bgr,
-                                   [cv2.IMWRITE_JPEG_QUALITY, 95])
-            enc[ck] = buf.tobytes() if ok else b""
-        infos[ck] = {}
+            return b"", info                 # not cached -> retry next rerun
     return enc[ck], infos.get(ck, {})
 
 
@@ -720,18 +921,26 @@ def render_stitch_result(snap, snap_key=None):
         for w in snap["warnings"]:
             st.write(f"- {w}")
 
-    # Panorama preview
+    # Panorama preview. For a ~100 000 px panorama the FULL-size
+    # BGR->RGB conversion alone is a ~0.5 GB allocation on EVERY rerun
+    # (and two of those copies starved the download encoders of RAM on
+    # the operator's machine — the empty PNG/JPEG downloads bug), so the
+    # image is downscaled FIRST and only the small copy is converted.
     st.subheader("Result")
-    panorama_rgb = cv2.cvtColor(snap["panorama_bgr"], cv2.COLOR_BGR2RGB)
-    h, w = panorama_rgb.shape[:2]
+    pan_bgr = snap["panorama_bgr"]
+    h, w = pan_bgr.shape[:2]
     if max(h, w) > 4000:
         st.info(f"Large image ({w}x{h}), showing downscaled preview. "
                 f"Download full size below.")
         s = 4000 / max(h, w)
-        preview = cv2.resize(panorama_rgb, None, fx=s, fy=s)
+        preview = cv2.cvtColor(
+            cv2.resize(pan_bgr, None, fx=s, fy=s,
+                       interpolation=cv2.INTER_AREA),
+            cv2.COLOR_BGR2RGB)
     else:
-        preview = panorama_rgb
+        preview = cv2.cvtColor(pan_bgr, cv2.COLOR_BGR2RGB)
     st.image(preview, use_container_width=True)
+    del preview
 
     # Operator tools available with EVERY stitching method (Stitcher and
     # Pair Review): the disk-distance check of calibration + stitch, and
@@ -782,24 +991,53 @@ def render_stitch_result(snap, snap_key=None):
     upload_calib = cross_section_map.get_calibration_for_upload(
         snap.get("upload_sig"))
     has_calib = bool(upload_calib and upload_calib.ok)
-    rgb = cv2.cvtColor(snap["panorama_bgr"], cv2.COLOR_BGR2RGB)
-    pan_h, pan_w = rgb.shape[:2]
-    data, dl_info = _snap_download_bytes(snap, snap["panorama_bgr"], rgb,
+    pan_h, pan_w = snap["panorama_bgr"].shape[:2]
+    data, dl_info = _snap_download_bytes(snap, snap["panorama_bgr"],
                                          upload_calib, ext, "pan")
     size_mb = len(data) / 1_000_000.0
 
     fname = f"panorama_{len(tiles_meta)}_tiles.{ext}"
-    st.download_button(
-        label=f"Download panorama ({out_format} · {size_mb:.1f} MB)",
-        data=data,
-        file_name=fname,
-        mime="image/png" if ext == "png" else "image/jpeg",
-        key=f"dl_pan_{source.lower().replace(' ', '_')}",
-    )
-    st.caption(f"File size: **{size_mb:.1f} MB** ({pan_w}×{pan_h} px). "
-               "PNG stores the panorama LOSSLESSLY — the pixels in the "
-               "file are exactly the pixels of the stitch, with no codec "
-               "layer that could alter them in any viewer.")
+    if not data:
+        # Encoding failed even after every fallback — say so LOUDLY
+        # instead of rendering a download button with an empty file (the
+        # operator's 'the file downloads but has no image' bug).
+        st.error(
+            f"**{out_format} encoding failed** for this panorama "
+            f"({pan_w}×{pan_h} px) — the download would be an empty "
+            "file, so the button is hidden. Most likely the machine "
+            "ran out of free memory: close other programs/tabs, then "
+            "re-run the stitch or simply re-open this tab and press the "
+            "download again (a failed encode is not cached and is "
+            "retried automatically). "
+            + ("PNG is the full-resolution lossless export — try it if "
+               "JPEG keeps failing. " if ext == "jpg" else ""))
+    else:
+        st.download_button(
+            label=f"Download panorama ({out_format} · {size_mb:.1f} MB)",
+            data=data,
+            file_name=fname,
+            mime="image/png" if ext == "png" else "image/jpeg",
+            key=f"dl_pan_{source.lower().replace(' ', '_')}",
+        )
+    if dl_info.get("downscaled"):
+        ow, oh = dl_info.get("out_size", (0, 0))
+        st.caption(
+            "JPEG side limit: the JPEG format cannot store a side longer "
+            "than 65500 px, so this very wide panorama was "
+            f"downscaled to {ow}×{oh} px for the JPEG download "
+            f"(×{dl_info.get('scale', 1.0):.3f} of the original). The "
+            "PNG download has NO such limit and stays full-resolution — "
+            "use it for the lossless export."
+            if ext == "jpg" else
+            f"Not enough free memory for the full-resolution PNG — the "
+            f"fallback copy is downscaled to {ow}×{oh} px "
+            f"(×{dl_info.get('scale', 1.0):.3f}). Free RAM and press the "
+            "download again for the full-resolution file.")
+    if data:
+        st.caption(f"File size: **{size_mb:.1f} MB** ({pan_w}×{pan_h} px). "
+                   "PNG stores the panorama LOSSLESSLY — the pixels in the "
+                   "file are exactly the pixels of the stitch, with no codec "
+                   "layer that could alter them in any viewer.")
     if has_calib:
         st.caption(f"Calibration: "
                    f"**{(1.0 / upload_calib.px_per_um):.6g} µm/px**. "
@@ -835,16 +1073,20 @@ def render_stitch_result(snap, snap_key=None):
         st.caption(
             f"Debug full-resolution panorama (no ROI crop): "
             f"{pan_full.shape[1]}x{pan_full.shape[0]} px.")
-        rgb_f = cv2.cvtColor(pan_full, cv2.COLOR_BGR2RGB)
         data_f, dl_info_f = _snap_download_bytes(
-            snap, pan_full, rgb_f, upload_calib, ext, "full")
-        st.download_button(
-            label=(f"Download panorama (FULL — debug, {out_format} · "
-                   f"{len(data_f) / 1_000_000.0:.1f} MB)"),
-            data=data_f,
-            file_name=f"panorama_{len(tiles_meta)}_tiles_full.{ext}",
-            mime="image/png" if ext == "png" else "image/jpeg",
-        )
+            snap, pan_full, upload_calib, ext, "full")
+        if not data_f:
+            st.caption("(Full-resolution debug panorama: encoding failed "
+                       "on this machine — free RAM and press the download "
+                       "again.)")
+        else:
+            st.download_button(
+                label=(f"Download panorama (FULL — debug, {out_format} · "
+                       f"{len(data_f) / 1_000_000.0:.1f} MB)"),
+                data=data_f,
+                file_name=f"panorama_{len(tiles_meta)}_tiles_full.{ext}",
+                mime="image/png" if ext == "png" else "image/jpeg",
+            )
 
     # CSV with tile positions
     import csv
@@ -1326,22 +1568,80 @@ def render_help_tab():
 
     with st.expander("\"Unable to allocate ... GiB for an array\" (Out of Memory)"):
         st.markdown(
-            "**Cause**: The canvas is too large for available RAM."
+            "**Cause**: The canvas was too large for the free RAM."
             "\n\n"
-            "**Fixes**:"
+            "**What the app does automatically now**: huge panoramas are "
+            "blended in a low-RAM mode — the canvas is assembled in narrow "
+            "column strips, so the multi-gigabyte float32 working arrays of "
+            "the standard blend are never allocated at full size. The "
+            "output is the same as the standard blend; you will see a "
+            "\"Low-RAM blending\" note in the warnings when it kicks in."
+            "\n\n"
+            "**If it still runs out of RAM** (the whole series no longer "
+            "fits in the FREE memory):"
             "\n"
-            "1. **Enable the ROI crop** (sidebar: Region of interest → "
-            "Crop tiles to ROI band). On 20 MP frames whose disk occupies ~1/4 "
-            "of the frame height, the panorama canvas shrinks ~4x in height — "
-            "and the per-tile Laplacian/weight pyramids shrink with it."
+            "1. Close other Streamlit tabs / heavy programs (browsers, "
+            "viewers) to free RAM."
             "\n"
-            "2. Reduce `Laplacian pyramid levels` to 3–4."
+            "2. Stitch a shorter row (fewer tiles) at a time."
             "\n"
-            "3. Keep **Blending weight mode** on **Feather** — the legacy "
-            "Focus-weighted mode and the Focus-priority mode each build one extra "
-            "per-tile weight pyramid (small, tile-sized, but non-zero)."
+            "3. **Enable the ROI crop** (sidebar: Region of interest → "
+            "Crop tiles to ROI band). On 20 MP frames whose disk occupies "
+            "~1/4 of the frame height, the panorama canvas shrinks ~4x in "
+            "height — and every per-tile array shrinks with it."
             "\n"
-            "4. For very large sets (>30 tiles), split into multiple panoramas."
+            "4. Keep **'Also keep full panorama (debug)' OFF** — it stores "
+            "a second, full-height panorama in RAM."
+            "\n"
+            "5. For very large sets (>30 tiles), split into multiple "
+            "panoramas."
+        )
+
+    with st.expander("The downloaded PNG/JPEG has no image (very wide "
+                     "panorama)"):
+        st.markdown(
+            "**Cause (JPEG)**: the JPEG format itself cannot store a side "
+            "longer than 65500 px — a ~99 000 px wide panorama CANNOT be "
+            "encoded as JPEG at full size at all (the encoder returned an "
+            "empty file, the broken jpeg you may have seen). **Fix (built "
+            "in)**: the JPEG download is now downscaled to 65500 px per "
+            "side automatically and a caption explains it. PNG has no "
+            "such limit — it stays full-resolution and remains the "
+            "lossless export."
+            "\n\n"
+            "**Cause (PNG/JPEG on a low-RAM machine)**: encoding a "
+            "466 MB panorama needs extra memory; earlier the render path "
+            "also made two avoidable full-size copies (~0.5 GB each) on "
+            "every rerun, which could starve the encoder — the file was "
+            "empty and the failure was silent. **Fix (built in)**: those "
+            "copies are gone, encoding uses a zero-copy path, a failed "
+            "encode is retried with a second encoder and (as a last "
+            "resort) a downscaled copy, and if everything fails you get "
+            "a red error message instead of an empty download. Just "
+            "press the download button again after freeing RAM — a "
+            "failed encode is never cached."
+        )
+
+    with st.expander("A panorama preview is blank / not clickable "
+                     "(tie points)"):
+        st.markdown(
+            "**Where**: section **3 · Tie points (disk edges)** of the "
+            "Cross-section Map tab."
+            "\n\n"
+            "**What the app does**: both tie-point previews are rendered "
+            "with a fixed display size sent from Python (the reliable "
+            "sizing mode — a preview re-mounted while the magnifier of "
+            "the other panorama opens/closes can no longer render cut "
+            "off or blank). The widget keys also change whenever the "
+            "pick structure changes, so a fresh preview always receives "
+            "its image data."
+            "\n\n"
+            "**If a preview EVER shows up blank or ignores clicks** (for "
+            "example after switching browser tabs on a low-memory "
+            "machine — the browser may discard the preview's iframe): "
+            "press the **'Previews blank / not clickable? — Restore'** "
+            "button under the x100 coordinate fields. Both previews are "
+            "re-mounted with fresh keys; all picked points are kept."
         )
 
     with st.expander("ROI band missed the disk on some tile"):
@@ -1879,6 +2179,13 @@ def render_stitcher_tab():
                 keep_full_panorama=keep_full,
                 progress_callback=update_progress,
             )
+        except MemoryError as e:
+            st.error(
+                f"Stitching ran out of RAM: {e}\n\n"
+                + _RAM_HELP_TEXT)
+            import traceback
+            st.code(traceback.format_exc())
+            return
         except Exception as e:
             st.error(f"Stitching error: {e}")
             import traceback
@@ -2547,6 +2854,13 @@ def render_pair_review_tab():
                 keep_full_panorama=keep_full_pr,
                 progress_callback=stitch_cb,
             )
+        except MemoryError as e:
+            st.error(
+                f"Stitching ran out of RAM: {e}\n\n"
+                + _RAM_HELP_TEXT)
+            import traceback
+            st.code(traceback.format_exc())
+            return
         except Exception as e:
             st.error(f"Stitching error: {e}")
             import traceback

@@ -1,0 +1,14 @@
+# Streamlit runtime configuration for the TEM Analysis Platform.
+#
+# Applies when the app is started with the PROJECT ROOT as the working
+# directory, e.g.:
+#   streamlit run apps/01_optical_stitcher/app.py
+#   streamlit run apps/02_grain_analyzer/app.py
+# Restart the Streamlit app after changing this file.
+# NOTE: this file was present in the previous delivery but got lost in
+# the project transfer — restored 2026-11-24.
+
+[server]
+# st.file_uploader size limit PER FILE, in MB. Streamlit's default is
+# 200 MB; the operator asked for 2 GB per file.
+maxUploadSize = 2048

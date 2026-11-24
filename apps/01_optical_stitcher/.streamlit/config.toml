@@ -1,0 +1,12 @@
+# Streamlit runtime configuration for the Optical Stitcher app.
+#
+# Used only when the app is started with THIS folder (apps/01_optical_stitcher)
+# as the working directory, e.g.:
+#   cd apps/01_optical_stitcher && streamlit run app.py
+# When the app is started from the project root, the root
+# .streamlit/config.toml applies instead. Restart the app after changes.
+
+[server]
+# st.file_uploader size limit PER FILE, in MB. Streamlit's default is
+# 200 MB; the operator asked for 2 GB per file.
+maxUploadSize = 2048

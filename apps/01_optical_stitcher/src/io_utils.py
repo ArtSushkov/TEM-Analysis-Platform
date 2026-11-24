@@ -502,3 +502,201 @@ def encode_tiff_rgb(image_rgb: np.ndarray,
     except Exception:
         return None                      # codec missing / args rejected
     return _finish(out.getvalue(), "lzw" if compress else "none")
+
+
+# ---------------------------------------------------------------------------
+# Auto LOSSLESS repack of uploaded TIFF files above the 5.7 MB target
+# (operator request, 2026-11): a TIFF larger than the target is
+# re-encoded with Deflate + horizontal predictor. Pixel values are kept
+# BIT-FOR-BIT (verified by a decode roundtrip before anything is
+# replaced) and the tags the calibration metadata scan reads
+# (ImageDescription / XResolution / YResolution / ResolutionUnit, plus
+# FEI vendor tags when they are available as raw text) are copied to
+# the repacked file, so metadata-based calibration still works after
+# the repack. Files that cannot reach the target are NOT altered
+# silently — the caller (app.py) shows an operator warning instead.
+# ---------------------------------------------------------------------------
+
+LOSSLESS_TARGET_BYTES = 5_700_000     # 5.7 MB (decimal) per operator request
+
+# Tag names copied to the repacked file. ImageDescription carries the
+# ImageJ / OME-XML / FEI-XML pixel-size metadata; the resolution tags
+# carry the standard TIFF scale; the remaining names are the vendor
+# tags scanned by cross_section_map.extract_pixel_size_metadata().
+_REPACK_COPY_TAGS = ("ImageDescription", "XResolution", "YResolution",
+                     "ResolutionUnit", "FEI_HELIOS", "FEI",
+                     "XmlMicroscopeDescription", "FEI_XML", "FEI_TITAN")
+
+
+def _lossless_repack_tiff_bytes(data: bytes) -> Tuple[Optional[bytes], str]:
+    """Losslessly re-encode one TIFF byte string.
+
+    Returns ``(new_bytes, message)``. ``new_bytes is None`` when the
+    file cannot / should not be repacked (the message says why). The
+    pixels of a successful repack are verified bit-for-bit identical to
+    the source before the new bytes are returned.
+    """
+    try:
+        with tifffile.TiffFile(_io.BytesIO(data)) as tf:
+            if len(tf.pages) != 1:
+                return None, "multi-page TIFF — left unchanged"
+            page = tf.pages[0]
+            arr = tf.asarray()
+            tag_values = {}
+            for tag in page.tags.values():
+                try:
+                    tag_values[tag.name] = tag
+                except Exception:
+                    continue
+    except Exception as e:
+        return None, f"cannot decode TIFF ({e}) — left unchanged"
+
+    kw = dict(compression="deflate", compressionargs={"level": 9},
+              predictor=True, metadata=None)
+    # Canonical ~256 KB strips (the layout some viewers require; same
+    # convention as the panorama exporter above).
+    _row_bytes = (arr.shape[1] * arr.shape[2]) if arr.ndim == 3 \
+        else arr.shape[1]
+    kw["rowsperstrip"] = max(1, 262144 // max(1, _row_bytes))
+
+    # Copy the metadata tags the app scans (scale-bar calibration).
+    desc_tag = tag_values.get("ImageDescription")
+    if desc_tag is not None:
+        v = desc_tag.value
+        if isinstance(v, bytes):
+            try:
+                v = v.decode("utf-8", errors="replace")
+            except Exception:
+                v = None
+        if isinstance(v, str) and v:
+            kw["description"] = v
+    xres_tag = tag_values.get("XResolution")
+    yres_tag = tag_values.get("YResolution")
+    runit_tag = tag_values.get("ResolutionUnit")
+    try:
+        def _tag_float(t):
+            if isinstance(t, (tuple, list)):
+                num, den = float(t[0]), float(t[1])
+                return num / den if den else None
+            return float(t)
+        if xres_tag is not None and yres_tag is not None:
+            xr, yr = _tag_float(xres_tag.value), _tag_float(yres_tag.value)
+            if xr is not None and yr is not None:
+                # Copy AS-IS (even a (0, 1) placeholder — many microscope
+                # writers store it; the calibration scanner ignores it).
+                kw["resolution"] = (xr, yr)
+        if runit_tag is not None:
+            ru = int(runit_tag.value)
+            if ru in (1, 2, 3):
+                kw["resolutionunit"] = ru
+    except Exception:
+        pass
+    # FEI vendor tags: copied only when tifffile hands them over as raw
+    # text (it may parse its own FEI semantics into a dict — then the
+    # tag is skipped; the scanner treats those tags as best-effort too).
+    extratags = []
+    for name in _REPACK_COPY_TAGS[4:]:
+        tag = tag_values.get(name)
+        if tag is None:
+            continue
+        v = tag.value
+        if isinstance(v, str):
+            v = v.encode("utf-8", errors="replace")
+        if not isinstance(v, bytes) or not v:
+            continue
+        code = getattr(tag, "code", None)
+        dtype = getattr(tag, "dtype", None)
+        if code is None or dtype is None:
+            continue
+        if not isinstance(dtype, str):
+            try:                      # tifffile DATATYPE IntEnum or int code
+                dtype = int(dtype)
+            except Exception:
+                continue
+        extratags.append((int(code), dtype, len(v), v, False))
+    if extratags:
+        kw["extratags"] = extratags
+
+    # Two attempts: with the horizontal predictor (best compression)
+    # and, if the writer rejects it for this pixel format, without it.
+    for trial_kw in (kw, {k: v for k, v in kw.items() if k != "predictor"}):
+        try:
+            out = _io.BytesIO()
+            tifffile.imwrite(out, arr, **trial_kw)
+            new_bytes = out.getvalue()
+            back = tifffile.imread(_io.BytesIO(new_bytes))
+            if not np.array_equal(arr, back):
+                continue                  # not lossless — try the next variant
+            return new_bytes, "ok"
+        except Exception:
+            continue
+    return None, "lossless re-encode failed — left unchanged"
+
+
+def lossless_repack_tiff_file(path: Path,
+                              target_bytes: int = LOSSLESS_TARGET_BYTES
+                              ) -> Optional[dict]:
+    """Repack one file losslessly if it is a TIFF above ``target_bytes``.
+
+    Returns a report dict when the file WAS above the target (so the UI
+    has something to report), ``None`` when the file is not a TIFF or
+    is already at/below the target (nothing to report). The original
+    file is replaced ONLY by a strictly smaller, pixel-identical
+    version — never by a bigger one.
+    """
+    p = Path(path)
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return None
+    if p.suffix.lower() not in (".tif", ".tiff") or size <= target_bytes:
+        return None
+    note = {"name": p.name, "orig": size, "final": size, "repacked": False,
+            "target_met": False, "msg": ""}
+    try:
+        rep, msg = _lossless_repack_tiff_bytes(p.read_bytes())
+    except Exception as e:
+        rep, msg = None, f"repack error: {e}"
+    if rep is None:
+        note["msg"] = msg
+        return note
+    if len(rep) >= size:
+        note["msg"] = ("lossless repack gave no size reduction — "
+                       "original kept")
+        return note
+    try:
+        tmp = p.with_name(p.name + ".repack_tmp")
+        tmp.write_bytes(rep)
+        tmp.replace(p)
+    except Exception as e:
+        note["msg"] = f"could not replace the file ({e}) — original kept"
+        return note
+    note.update(repacked=True, final=len(rep),
+                target_met=len(rep) <= target_bytes, msg="")
+    return note
+
+
+def repack_folder_tiffs_above_target(
+        folder: Path, target_bytes: int = LOSSLESS_TARGET_BYTES) -> List[dict]:
+    """Run :func:`lossless_repack_tiff_file` on every TIFF in the upload
+    folder (top level — the same scope ``load_tiles`` scans).
+
+    Returns the non-empty reports (files at/below the target are not
+    reported at all). Never raises: per-file failures are returned as
+    reports with a message instead.
+    """
+    folder = Path(folder)
+    notes: List[dict] = []
+    if not folder.is_dir():
+        return notes
+    for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+        if not (p.is_file() and p.suffix.lower() in (".tif", ".tiff")):
+            continue
+        try:
+            note = lossless_repack_tiff_file(p, target_bytes)
+        except Exception as e:            # belt & braces — never break a load
+            note = {"name": p.name, "orig": 0, "final": 0, "repacked": False,
+                    "target_met": False, "msg": f"repack error: {e}"}
+        if note is not None:
+            notes.append(note)
+    return notes

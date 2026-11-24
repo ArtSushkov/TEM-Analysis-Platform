@@ -41,6 +41,33 @@ def apply_clahe(
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
+def sharpness_raw_map(img: np.ndarray, block_size: int = 16) -> np.ndarray:
+    """UN-normalized sharpness map (the internals of `sharpness_map`).
+
+    Returns the block-averaged squared-Laplacian energy WITHOUT the
+    per-image min/max normalization, so callers that need a NORMALIZATION
+    CONSTANT computed over a DIFFERENT pixel set (e.g. the slabbed blender,
+    which normalizes a slice with the constants of the whole tile) can
+    replicate `sharpness_map` exactly:
+
+        raw = sharpness_raw_map(img, block_size)
+        smin, smax = raw.min(), raw.max()
+        sharp = (raw - smin) / (smax - smin)   # == sharpness_map(img)
+    """
+    gray = to_gray(img).astype(np.float32)
+    lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+    energy = lap * lap  # squared deviation
+
+    # Average over block_size blocks
+    # For each pixel, take the average energy in its block
+    kernel = np.ones((block_size, block_size), dtype=np.float32) / (block_size * block_size)
+    sharp = cv2.filter2D(energy, -1, kernel, borderType=cv2.BORDER_REFLECT)
+
+    # Additional light smoothing to avoid noisy weights
+    sharp = cv2.GaussianBlur(sharp, (0, 0), sigmaX=block_size / 2.0)
+    return sharp.astype(np.float32)
+
+
 def sharpness_map(img: np.ndarray, block_size: int = 16) -> np.ndarray:
     """Local sharpness map (Laplacian variance per block), normalized per-tile.
 
@@ -53,18 +80,7 @@ def sharpness_map(img: np.ndarray, block_size: int = 16) -> np.ndarray:
 
     Returns: float32 array of the same HxW as input, range [0, 1].
     """
-    gray = to_gray(img).astype(np.float32)
-    lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
-    energy = lap * lap  # squared deviation
-
-    h, w = gray.shape
-    # Average over block_size blocks
-    # For each pixel, take the average energy in its block
-    kernel = np.ones((block_size, block_size), dtype=np.float32) / (block_size * block_size)
-    sharp = cv2.filter2D(energy, -1, kernel, borderType=cv2.BORDER_REFLECT)
-
-    # Additional light smoothing to avoid noisy weights
-    sharp = cv2.GaussianBlur(sharp, (0, 0), sigmaX=block_size / 2.0)
+    sharp = sharpness_raw_map(img, block_size=block_size)
 
     # Normalize to [0, 1]
     smin, smax = sharp.min(), sharp.max()

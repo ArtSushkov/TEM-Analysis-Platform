@@ -14,6 +14,7 @@ Steps:
 """
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -260,6 +261,15 @@ def stitch_row(
     # === Step 1: pairwise stitching ===
     pair_results: List[PairDiagnostic] = []
 
+    # Estimation intermediates (freed before the blend — see Step 4):
+    # the per-tile CLAHE/SIFT cache and the downscaled estimation copies
+    # are pure estimation working set; the full-res CLAHE cache entries
+    # alone cost ~20-30 MB PER TILE, which on a 20-tile row is several
+    # hundred MB of RAM the blend stage desperately needs on small-RAM
+    # machines (operator report: MemoryError during the blend).
+    tile_cache: Dict[int, Tuple] = {}
+    est_imgs: Optional[List[np.ndarray]] = None
+
     if use_overrides:
         # Positions fixed by the Pair Review workflow — no estimation.
         report("Using reviewed / manual pair positions (estimation skipped)...", 0.60)
@@ -297,7 +307,8 @@ def stitch_row(
         # run twice per interior tile. The cache is keyed by id(img) (the
         # pipeline holds the SAME ndarray object for each tile throughout
         # the row, so id(img) is stable). Fresh per row, discarded at exit.
-        tile_cache: Dict[int, Tuple] = {}
+        # (tile_cache is pre-created before the branch — cleared before the
+        # blend in Step 4.)
 
         # Downscale-for-estimation: when estimation_max_side is set and the
         # tiles are larger, all pairwise estimation (SIFT + NCC + phase +
@@ -307,7 +318,7 @@ def stitch_row(
         # run to recover sub-pixel accuracy. Blending always happens on
         # the ORIGINAL full-resolution images, so panorama quality is
         # unchanged.
-        est_imgs: List[np.ndarray] = list(t.image for t in tiles)
+        est_imgs = list(t.image for t in tiles)
         est_scale = 1.0
         if estimation_max_side and estimation_max_side > 0:
             h0, w0 = tiles[0].image.shape[:2]
@@ -568,6 +579,15 @@ def stitch_row(
     canvas_h = max_y_end - min_y
 
     # === Step 4: prepare PlacedTile and blend ===
+    # Free every estimation intermediate BEFORE the blend: the blend is the
+    # peak-RAM stage of the whole pipeline, and on small-RAM machines every
+    # hundred MB counts (the feature cache alone holds a full-res CLAHE
+    # BGR + grayscale copy per tile).
+    tile_cache.clear()
+    if est_imgs is not None:
+        del est_imgs
+    gc.collect()
+
     report(f"Assembling panorama {canvas_w}x{canvas_h} (multi-band blending)...", 0.7)
     # Tiles adjacent to a "no overlap" pair keep full weight on the gap-facing
     # edge (no feather falloff), so the black separator band has crisp borders.
@@ -601,7 +621,14 @@ def stitch_row(
         focus_priority_gamma=blend_focus_priority_gamma,
         focus_priority_levels=blend_focus_priority_levels,
         repair_stats=repair_stats,
+        progress_callback=progress_callback,
     )
+    if repair_stats.get("mode") == "slabbed":
+        warnings.append(
+            f"Low-RAM blending: the panorama canvas was too large for a "
+            f"single in-memory blend, so it was assembled from "
+            f"{repair_stats['slabs']} column strips (automatic; the output "
+            f"matches the standard blend).")
     if repair_stats.get("gap_px_filled"):
         warnings.append(
             f"Artifact repair: {repair_stats['gap_px_filled']} uncovered "
@@ -662,6 +689,12 @@ def stitch_row(
                 )
             except Exception as e:
                 warnings.append(f"keep_full_panorama failed: {e}")
+
+    # Release the stitching intermediates (per-pair feature caches, the
+    # compensated tile copies, the blend pyramids) back to the OS before
+    # the panorama is kept in the session — on small-RAM machines the
+    # next steps (download encoding, Pair Review previews) need the room.
+    gc.collect()
 
     return StitchResult(
         panorama=panorama,
